@@ -23,6 +23,11 @@ jobs:
       - name: 启动 Flask 后端（后台运行）
         run: |
           nohup python3 cs.py &
+          sleep 5
+
+      - name: 测试后端接口
+        run: |
+          curl -X POST http://localhost:5000/add_employee -H "Content-Type: application/json" -d '{"emp_id":"test"}'
 
       - name: 启动 ngrok（暴露 5000 端口）
         run: |
