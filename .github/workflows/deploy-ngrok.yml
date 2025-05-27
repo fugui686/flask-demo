@@ -20,10 +20,11 @@ jobs:
           tar -xzf ngrok-v3-stable-linux-amd64.tgz
           sudo mv ngrok /usr/local/bin
 
-      - name: 启动 Flask 后端（后台运行）
+      - name: 启动 Flask 后端（后台运行，并输出日志）
         run: |
-          nohup python3 cs.py &
+          nohup python3 cs.py > flask.log 2>&1 &
           sleep 5
+          cat flask.log
 
       - name: 测试后端接口
         run: |
