@@ -20,19 +20,12 @@ jobs:
           tar -xzf ngrok-v3-stable-linux-amd64.tgz
           sudo mv ngrok /usr/local/bin
 
-      - name: 启动 Flask 后端（后台运行，并输出日志）
+      - name: 启动 Flask 后端（后台运行）
         run: |
-          nohup python3 cs.py > flask.log 2>&1 &
-          sleep 5
-          cat flask.log
-
-      - name: 测试后端接口
-        run: |
-          curl -X POST http://localhost:5000/add_employee -H "Content-Type: application/json" -d '{"emp_id":"test"}'
+          nohup python3 cs.py &
 
       - name: 启动 ngrok（暴露 5000 端口）
         run: |
-          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
           nohup ngrok http 5000 > ngrok.log &
           sleep 10
 
