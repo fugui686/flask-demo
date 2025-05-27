@@ -1,0 +1,35 @@
+name: Flask with Ngrok
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 依赖
+        run: |
+          pip3 install flask
+
+      - name: 安装 ngrok
+        run: |
+          wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar -xzf ngrok-v3-stable-linux-amd64.tgz
+          sudo mv ngrok /usr/local/bin
+
+      - name: 启动 Flask 后端（后台运行）
+        run: |
+          nohup python3 cs.py &
+
+      - name: 启动 ngrok（暴露 5000 端口）
+        run: |
+          nohup ngrok http 5000 > ngrok.log &
+          sleep 10
+
+      - name: 查看 ngrok 公网地址
+        run: |
+          curl -s http://localhost:4040/api/tunnels > tunnels.json
+          cat tunnels.json
