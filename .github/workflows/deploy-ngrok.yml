@@ -26,6 +26,7 @@ jobs:
 
       - name: 启动 ngrok（暴露 5000 端口）
         run: |
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
           nohup ngrok http 5000 > ngrok.log &
           sleep 10
 
