@@ -11,8 +11,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 安装 Python 依赖
-        run: |
-          pip3 install flask
+        run: pip3 install flask
 
       - name: 安装 ngrok
         run: |
@@ -21,8 +20,7 @@ jobs:
           sudo mv ngrok /usr/local/bin
 
       - name: 启动 Flask 后端（后台运行）
-        run: |
-          nohup python3 cs.py &
+        run: nohup python3 cs.py &
 
       - name: 启动 ngrok（暴露 5000 端口）
         run: |
@@ -34,3 +32,8 @@ jobs:
         run: |
           curl -s http://localhost:4040/api/tunnels > tunnels.json
           cat tunnels.json
+
+      - name: 保活30分钟，方便测试
+        run: |
+          echo "后端和 ngrok 已经启动，公网地址已打印，30分钟内都可以用，测试完成后可手动 Cancel Workflow"
+          sleep 1800
