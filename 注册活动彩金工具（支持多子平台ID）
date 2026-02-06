@@ -1,0 +1,1086 @@
+import sys
+import os
+import configparser
+import time
+import random
+import requests
+from openpyxl import Workbook
+from openpyxl.styles import Alignment
+from datetime import datetime, timedelta, time as dtime, date as DateType
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtCore import QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+
+
+# ===================== 活动规则配置 =====================
+
+# 3天活动：按有效投注赠送
+赠送档位列表_3 = [
+    (500000, 888),
+    (300000, 388),
+    (100000, 188),
+    (50000, 88),
+    (20000, 38),
+    (5000, 18),
+    (2000, 8),
+    (800, 5),
+    (100, 2),
+]
+
+# 14天活动：按总有效投注赠送
+赠送档位列表_14 = [
+    (1000000, 1888),
+    (600000, 888),
+    (300000, 388),
+    (100000, 188),
+    (50000, 88),
+    (20000, 38),
+    (5000, 28),
+    (1000, 8),
+]
+
+# 30天活动：按总有效投注赠送
+赠送档位列表_30 = [
+    (3000000, 1888),
+    (1000000, 888),
+    (600000, 588),
+    (300000, 288),
+    (100000, 88),
+    (50000, 38),
+    (20000, 28),
+    (3000, 8),
+]
+
+
+# ===================== 公共工具函数 =====================
+
+def 时间转时间戳(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+
+def 随机延迟():
+    time.sleep(random.uniform(1, 3))
+
+
+def 请求带重试(url, headers, json_data, desc: str, max_retries: int = 3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=json_data, timeout=20)
+        except requests.RequestException as e:
+            print(f"[{desc}] 第 {attempt} 次请求异常：{e}")
+            if attempt < max_retries:
+                随机延迟()
+                continue
+            else:
+                return None
+
+        status = resp.status_code
+        if 200 <= status < 300:
+            return resp
+
+        if 400 <= status < 600:
+            print(f"[{desc}] 第 {attempt} 次请求返回 {status}，准备重试...")
+            if attempt < max_retries:
+                随机延迟()
+                continue
+            else:
+                print(f"[{desc}] 多次重试后仍失败，放弃。状态码：{status}")
+                return None
+        else:
+            print(f"[{desc}] 返回异常状态码：{status}")
+            return resp
+
+    return None
+
+
+def 计算赠送金额(有效投注: float, tiers) -> int:
+    """通用梯度计算：从高到低匹配第一档"""
+    for 门槛, 金额 in tiers:
+        if 有效投注 >= 门槛:
+            return 金额
+    return 0
+
+
+def 获取桌面路径() -> str:
+    """尽量获取桌面路径，不存在则退回用户目录"""
+    home = os.path.expanduser("~")
+    desktop = os.path.join(home, "Desktop")
+    if os.path.isdir(desktop):
+        return desktop
+    return home
+
+
+def 批量获取会员总报表_by_user_list(
+    会员ID集合,
+    平台ID,
+    子平台ID,
+    start_ts,
+    end_ts,
+    域名,
+    cookie,
+    log_func,
+    desc_prefix
+):
+    """
+    使用 userIdx 批量查询会员总报表：
+    - 会员ID集合：set / list
+    - 每批最多 1000 个账号
+    - 返回汇总的 list（每个元素为接口返回的 aa）
+    """
+    if not 会员ID集合:
+        return []
+
+    all_records = []
+    user_list = [str(u) for u in 会员ID集合]
+    PAGE_LIMIT = 1000
+
+    headers = {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'childsitecode': 子平台ID,
+        'companycode': 平台ID,
+        'loginbacktype': '3',
+        'sitecode': 平台ID,
+        'Cookie': cookie,
+    }
+    url = f'https://{域名}/api/go-gateway-internal/noEncrypt/statistics/report/user_report'
+
+    batch_index = 1
+    for i in range(0, len(user_list), PAGE_LIMIT):
+        batch = user_list[i:i + PAGE_LIMIT]
+        json_data = {
+            'currency': 'CNY',
+            'userIdx': batch,
+            'siteCode': 子平台ID,
+            'startTime': start_ts,
+            'endTime': end_ts,
+            'pageSort': {
+                'page': 1,
+                'limit': len(batch),
+            },
+        }
+        log_func(f"{desc_prefix} 总报表：第 {batch_index} 批，账号数 {len(batch)}")
+        resp = 请求带重试(url, headers, json_data, desc=f"{desc_prefix}-总报表-第{batch_index}批")
+        if resp is None:
+            log_func(f"{desc_prefix} 总报表：第 {batch_index} 批请求失败，停止后续批次。")
+            break
+
+        data = resp.json().get('data', {})
+        列表 = data.get('list', []) or []
+        if not 列表:
+            log_func(f"{desc_prefix} 总报表：第 {batch_index} 批无数据。")
+        else:
+            log_func(f"{desc_prefix} 总报表：第 {batch_index} 批返回 {len(列表)} 条记录。")
+            all_records.extend(列表)
+
+        batch_index += 1
+        随机延迟()
+
+    log_func(f"{desc_prefix} 总报表：共获取 {len(all_records)} 条记录。")
+    return all_records
+
+
+def 导出桌面_注册满3天(子平台ID: str, 数据行列表):
+    """
+    在桌面导出“子平台ID注册满三天_YYYYMMDD_HHMMSS.xlsx”
+    表头：
+    品牌ID	会员ID	会员账号	奖励金额(必填)	稽核倍数(必填)	前台备注	后台备注
+    """
+    if not 数据行列表:
+        return
+
+    desktop = 获取桌面路径()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    文件名 = f"{子平台ID}注册满三天_{ts}.xlsx"
+    保存路径 = os.path.join(desktop, 文件名)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "注册满三天"
+
+    表头 = ["品牌ID", "会员ID", "会员账号", "奖励金额(必填)", "稽核倍数(必填)", "前台备注", "后台备注", '加倍奖金奖励倍数', '加倍奖金稽核倍数']
+    ws.append(表头)
+
+    对齐 = Alignment(horizontal='center', vertical='center')
+
+    for row in 数据行列表:
+        # row: [会员ID, 会员账号, 累计充值, 累计充值次数, 累计有效投注, 赠送金额]
+        会员ID, 会员账号, _, _, _, 赠送金额 = row
+        ws.append([
+            子平台ID,
+            会员ID,
+            会员账号,
+            赠送金额,
+            0,  # 稽核倍数
+            "注册满三天",
+            "注册满三天",
+            1,
+            5,
+        ])
+
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=len(表头)):
+        for cell in row:
+            cell.alignment = 对齐
+
+    wb.save(保存路径)
+
+    try:
+        os.startfile(保存路径)
+    except Exception as e:
+        print(f"[注册满三天] 自动打开桌面文件失败：{e}")
+
+
+def 导出桌面_注册满14_30(子平台ID: str, 数据行列表):
+    """
+    在桌面导出“子平台ID注册满14天30天_YYYYMMDD_HHMMSS.xlsx”
+
+    表头：
+    品牌ID	会员ID	会员账号	奖励金额(必填)	稽核倍数(必填)	前台备注	后台备注
+
+    - 稽核倍数固定=3
+    - 备注：注册满14天30天还送8888元
+    - 数据行格式： [会员ID, 会员账号, 赠送金额, "14天"/"30天"]
+    """
+    if not 数据行列表:
+        return
+
+    desktop = 获取桌面路径()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    文件名 = f"{子平台ID}注册满14天30天_{ts}.xlsx"
+    保存路径 = os.path.join(desktop, 文件名)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "注册满14_30天"
+
+    表头 = ["品牌ID", "会员ID", "会员账号", "奖励金额(必填)", "稽核倍数(必填)", "前台备注", "后台备注", '加倍奖金奖励倍数', '加倍奖金稽核倍数']
+    ws.append(表头)
+
+    对齐 = Alignment(horizontal='center', vertical='center')
+
+    for row in 数据行列表:
+        会员ID = row[0]
+        会员账号 = row[1]
+        赠送金额 = row[2]
+        ws.append([
+            子平台ID,
+            会员ID,
+            会员账号,
+            赠送金额,
+            3,  # 稽核倍数
+            "注册满14天30天还送8888元",
+            "注册满14天30天还送8888元",
+            1,
+            5,
+        ])
+
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=len(表头)):
+        for cell in row:
+            cell.alignment = 对齐
+
+    wb.save(保存路径)
+
+    try:
+        os.startfile(保存路径)
+    except Exception as e:
+        print(f"[注册满14/30天] 自动打开桌面文件失败：{e}")
+
+
+# ===================== 主业务逻辑：三个活动 =====================
+
+def 主流程(平台ID: str, 子平台ID: str, 域名: str, cookie: str, log_func=print):
+    """
+    平台ID、子平台ID、域名、cookie 都从 UI 传进来。
+    log_func 用来把日志回调到 UI（默认用 print）。
+
+    支持：3天 + 14天 + 30天
+    且 3/14/30 的统计结束时间统一为“昨天 23:59:59”。
+    """
+    今天: DateType = datetime.today().date()
+    昨天: DateType = 今天 - timedelta(days=1)
+    每页数量 = 1000
+
+    headers_首存 = {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'childsitecode': 子平台ID,
+        'companycode': 平台ID,
+        'loginbacktype': '3',
+        'sitecode': 平台ID,
+        'Cookie': cookie,
+    }
+
+    所有首存会员url = f'https://{域名}/api/go-gateway-internal/user/advancedGetUserListV2'
+
+    wb = Workbook()
+    对齐 = Alignment(horizontal='center', vertical='center')
+
+    # 用于桌面导出的两类数据
+    桌面_3天_rows = []
+    桌面_14_30_rows = []
+
+    # ==================================================================
+    # 一、注册3天活动（首存日 D0 = 今天-3，统计 D0~昨天，共3天）
+    # ==================================================================
+    log_func(f"====== [{子平台ID}] 开始处理【注册3天活动】======")
+    首存日期_3 = 今天 - timedelta(days=3)  # 例：今天 27 → 首存日 24
+
+    首存开始时间_3 = datetime.combine(首存日期_3, dtime.min)
+    首存结束时间_3 = datetime.combine(首存日期_3, dtime.max)
+    活动开始时间_3 = 首存开始时间_3
+    活动结束时间_3 = datetime.combine(昨天, dtime.max)   # 结束统一用“昨天”
+
+    log_func(f"[3天][{子平台ID}] 首存日期: {首存日期_3}（D0 = 今天-3）")
+    log_func(f"[3天][{子平台ID}] 统计时间: {活动开始时间_3} ~ {活动结束时间_3}（首存日~昨天）")
+
+    首存开始时间戳_3 = 时间转时间戳(首存开始时间_3)
+    首存结束时间戳_3 = 时间转时间戳(首存结束时间_3)
+    活动开始时间戳_3 = 时间转时间戳(活动开始时间_3)
+    活动结束时间戳_3 = 时间转时间戳(活动结束时间_3)
+
+    首存会员ID集合_3 = set()
+
+    当前页 = 1
+    while True:
+        首存会员json_data = {
+            'selectTimeKey': 2,
+            'accountTypes': [],
+            'childSiteCode': 子平台ID,
+            'current': 当前页,
+            'size': 每页数量,
+            'firstPayTimeFrom': 首存开始时间戳_3,
+            'firstPayTimeTo': 首存结束时间戳_3,
+        }
+
+        resp = 请求带重试(
+            所有首存会员url,
+            headers_首存,
+            首存会员json_data,
+            desc=f"[3天][{子平台ID}] 首存接口-第{当前页}页"
+        )
+        if resp is None:
+            log_func(f"[3天][{子平台ID}] 首存接口第 {当前页} 页请求失败，停止拉取3天首存。")
+            break
+
+        data = resp.json().get('data', {})
+        列表 = data.get('data', []) or []
+        if not 列表:
+            log_func(f"[3天][{子平台ID}] 首存接口第 {当前页} 页无数据，结束3天首存拉取。")
+            break
+
+        log_func(f"[3天][{子平台ID}] 首存接口第 {当前页} 页，获取到 {len(列表)} 条首存记录。")
+
+        for aa in 列表:
+            会员ID = aa.get('useridx')
+            if 会员ID is None:
+                continue
+            首存会员ID集合_3.add(会员ID)
+
+        if len(列表) < 每页数量:
+            log_func(f"[3天][{子平台ID}] 首存接口数据已全部拉取完毕。")
+            break
+
+        当前页 += 1
+        随机延迟()
+
+    log_func(f"[3天][{子平台ID}] 首存会员总人数：{len(首存会员ID集合_3)}")
+
+    用户统计_3 = {}
+    导出数据_3天 = []
+
+    if 首存会员ID集合_3:
+        # 使用 userIdx 批量查会员总报表
+        报表列表_3 = 批量获取会员总报表_by_user_list(
+            首存会员ID集合_3,
+            平台ID,
+            子平台ID,
+            活动开始时间戳_3,
+            活动结束时间戳_3,
+            域名,
+            cookie,
+            log_func,
+            desc_prefix=f"[3天][{子平台ID}]"
+        )
+
+        for aa in 报表列表_3:
+            会员ID = aa.get('userIdx')
+            if 会员ID is None:
+                continue
+
+            会员账号 = aa.get('username') or ''
+            充值金额 = aa.get('deposit') or 0
+            有效投注 = aa.get('validBet') or 0
+            充值次数 = aa.get('depositTimes') or 0
+
+            try:
+                充值金额 = float(充值金额)
+            except (TypeError, ValueError):
+                充值金额 = 0.0
+            try:
+                有效投注 = float(有效投注)
+            except (TypeError, ValueError):
+                有效投注 = 0.0
+            try:
+                充值次数 = int(充值次数)
+            except (TypeError, ValueError):
+                充值次数 = 0
+
+            if 会员ID not in 用户统计_3:
+                用户统计_3[会员ID] = {
+                    "会员账号": 会员账号,
+                    "充值": 0.0,
+                    "有效投注": 0.0,
+                    "充值次数": 0,
+                }
+
+            用户统计_3[会员ID]["充值"] += 充值金额
+            用户统计_3[会员ID]["有效投注"] += 有效投注
+            用户统计_3[会员ID]["充值次数"] += 充值次数
+
+        log_func(f"[3天][{子平台ID}] 参与统计的首存会员数量：{len(用户统计_3)}")
+
+        for 会员ID, 统计 in 用户统计_3.items():
+            会员账号 = 统计.get("会员账号", "")
+            累计充值 = 统计.get("充值", 0.0)
+            累计有效投注 = 统计.get("有效投注", 0.0)
+            累计充值次数 = 统计.get("充值次数", 0)
+
+            if 累计充值 < 100:
+                continue
+
+            赠送金额 = 计算赠送金额(累计有效投注, 赠送档位列表_3)
+            if 赠送金额 <= 0:
+                continue
+
+            row = [
+                会员ID,
+                会员账号,
+                累计充值,
+                累计充值次数,
+                累计有效投注,
+                赠送金额,
+            ]
+            导出数据_3天.append(row)
+            桌面_3天_rows.append(row)
+
+    log_func(f"[3天][{子平台ID}] 符合赠送条件的人数：{len(导出数据_3天)}")
+
+    # ==================================================================
+    # 二、注册14天活动（首存日 D0 = 今天-13，统计 D0~昨天）
+    # ==================================================================
+    log_func(f"====== [{子平台ID}] 开始处理【注册14天活动】======")
+    首存日期_14 = 今天 - timedelta(days=13)
+
+    首存开始时间_14 = datetime.combine(首存日期_14, dtime.min)
+    首存结束时间_14 = datetime.combine(首存日期_14, dtime.max)
+    统计开始时间_14 = 首存开始时间_14
+    统计结束时间_14 = datetime.combine(昨天, dtime.max)
+
+    log_func(f"[14天][{子平台ID}] 首存日期: {首存日期_14}（D0 = 今天-13）")
+    log_func(f"[14天][{子平台ID}] 统计时间: {统计开始时间_14} ~ {统计结束时间_14}（首存日~昨天）")
+
+    首存开始时间戳_14 = 时间转时间戳(首存开始时间_14)
+    首存结束时间戳_14 = 时间转时间戳(首存结束时间_14)
+    统计开始时间戳_14 = 时间转时间戳(统计开始时间_14)
+    统计结束时间戳_14 = 时间转时间戳(统计结束时间_14)
+
+    首存会员ID集合_14 = set()
+    当前页 = 1
+    while True:
+        首存会员json_data_14 = {
+            'selectTimeKey': 2,
+            'accountTypes': [],
+            'childSiteCode': 子平台ID,
+            'current': 当前页,
+            'size': 每页数量,
+            'firstPayTimeFrom': 首存开始时间戳_14,
+            'firstPayTimeTo': 首存结束时间戳_14,
+        }
+
+        resp = 请求带重试(
+            所有首存会员url,
+            headers_首存,
+            首存会员json_data_14,
+            desc=f"[14天][{子平台ID}] 首存接口-第{当前页}页"
+        )
+        if resp is None:
+            log_func(f"[14天][{子平台ID}] 首存接口第 {当前页} 页请求失败，停止拉取14天首存。")
+            break
+
+        data = resp.json().get('data', {})
+        列表 = data.get('data', []) or []
+        if not 列表:
+            log_func(f"[14天][{子平台ID}] 首存接口第 {当前页} 页无数据，结束14天首存拉取。")
+            break
+
+        log_func(f"[14天][{子平台ID}] 首存接口第 {当前页} 页，获取到 {len(列表)} 条首存记录。")
+
+        for aa in 列表:
+            会员ID = aa.get('useridx')
+            if 会员ID is None:
+                continue
+            首存会员ID集合_14.add(会员ID)
+
+        if len(列表) < 每页数量:
+            log_func(f"[14天][{子平台ID}] 首存接口数据已全部拉取完毕。")
+            break
+
+        当前页 += 1
+        随机延迟()
+
+    log_func(f"[14天][{子平台ID}] 首存会员总人数：{len(首存会员ID集合_14)}")
+
+    用户统计_14 = {}
+    导出数据_14天 = []
+
+    if 首存会员ID集合_14:
+        报表列表_14 = 批量获取会员总报表_by_user_list(
+            首存会员ID集合_14,
+            平台ID,
+            子平台ID,
+            统计开始时间戳_14,
+            统计结束时间戳_14,
+            域名,
+            cookie,
+            log_func,
+            desc_prefix=f"[14天][{子平台ID}]"
+        )
+
+        for aa in 报表列表_14:
+            会员ID = aa.get('userIdx')
+            if 会员ID is None:
+                continue
+            if 会员ID not in 首存会员ID集合_14:
+                continue
+
+            会员账号 = aa.get('username') or ''
+            充值金额 = aa.get('deposit') or 0
+            有效投注 = aa.get('validBet') or 0
+
+            try:
+                充值金额 = float(充值金额)
+            except (TypeError, ValueError):
+                充值金额 = 0.0
+            try:
+                有效投注 = float(有效投注)
+            except (TypeError, ValueError):
+                有效投注 = 0.0
+
+            if 会员ID not in 用户统计_14:
+                用户统计_14[会员ID] = {
+                    "会员账号": 会员账号,
+                    "充值": 0.0,
+                    "有效投注": 0.0,
+                }
+
+            用户统计_14[会员ID]["充值"] += 充值金额
+            用户统计_14[会员ID]["有效投注"] += 有效投注
+
+        log_func(f"[14天][{子平台ID}] 参与统计的首存会员数量：{len(用户统计_14)}")
+
+        for 会员ID, 统计 in 用户统计_14.items():
+            会员账号 = 统计.get("会员账号", "")
+            累计充值 = 统计.get("充值", 0.0)
+            累计有效投注 = 统计.get("有效投注", 0.0)
+
+            if 累计充值 < 300:
+                continue
+
+            赠送金额 = 计算赠送金额(累计有效投注, 赠送档位列表_14)
+            if 赠送金额 <= 0:
+                continue
+
+            row = [
+                会员ID,
+                会员账号,
+                赠送金额,
+                累计充值,
+                累计有效投注,
+            ]
+            导出数据_14天.append(row)
+            桌面_14_30_rows.append([会员ID, 会员账号, 赠送金额, "14天"])
+
+    log_func(f"[14天][{子平台ID}] 符合赠送条件的人数：{len(导出数据_14天)}")
+
+    # ==================================================================
+    # 三、注册30天活动（首存日 D0 = 今天-29，统计 D0~昨天）
+    # ==================================================================
+    log_func(f"====== [{子平台ID}] 开始处理【注册30天活动】======")
+    首存日期_30 = 今天 - timedelta(days=29)
+
+    首存开始时间_30 = datetime.combine(首存日期_30, dtime.min)
+    首存结束时间_30 = datetime.combine(首存日期_30, dtime.max)
+    统计开始时间_30 = 首存开始时间_30
+    统计结束时间_30 = datetime.combine(昨天, dtime.max)
+
+    log_func(f"[30天][{子平台ID}] 首存日期: {首存日期_30}（D0 = 今天-29）")
+    log_func(f"[30天][{子平台ID}] 统计时间: {统计开始时间_30} ~ {统计结束时间_30}（首存日~昨天）")
+
+    首存开始时间戳_30 = 时间转时间戳(首存开始时间_30)
+    首存结束时间戳_30 = 时间转时间戳(首存结束时间_30)
+    统计开始时间戳_30 = 时间转时间戳(统计开始时间_30)
+    统计结束时间戳_30 = 时间转时间戳(统计结束时间_30)
+
+    首存会员ID集合_30 = set()
+    当前页 = 1
+    while True:
+        首存会员json_data_30 = {
+            'selectTimeKey': 2,
+            'accountTypes': [],
+            'childSiteCode': 子平台ID,
+            'current': 当前页,
+            'size': 每页数量,
+            'firstPayTimeFrom': 首存开始时间戳_30,
+            'firstPayTimeTo': 首存结束时间戳_30,
+        }
+
+        resp = 请求带重试(
+            所有首存会员url,
+            headers_首存,
+            首存会员json_data_30,
+            desc=f"[30天][{子平台ID}] 首存接口-第{当前页}页"
+        )
+        if resp is None:
+            log_func(f"[30天][{子平台ID}] 首存接口第 {当前页} 页请求失败，停止拉取30天首存。")
+            break
+
+        data = resp.json().get('data', {})
+        列表 = data.get('data', []) or []
+        if not 列表:
+            log_func(f"[30天][{子平台ID}] 首存接口第 {当前页} 页无数据，结束30天首存拉取。")
+            break
+
+        log_func(f"[30天][{子平台ID}] 首存接口第 {当前页} 页，获取到 {len(列表)} 条首存记录。")
+
+        for aa in 列表:
+            会员ID = aa.get('useridx')
+            if 会员ID is None:
+                continue
+            首存会员ID集合_30.add(会员ID)
+
+        if len(列表) < 每页数量:
+            log_func(f"[30天][{子平台ID}] 首存接口数据已全部拉取完毕。")
+            break
+
+        当前页 += 1
+        随机延迟()
+
+    log_func(f"[30天][{子平台ID}] 首存会员总人数：{len(首存会员ID集合_30)}")
+
+    用户统计_30 = {}
+    导出数据_30天 = []
+
+    if 首存会员ID集合_30:
+        报表列表_30 = 批量获取会员总报表_by_user_list(
+            首存会员ID集合_30,
+            平台ID,
+            子平台ID,
+            统计开始时间戳_30,
+            统计结束时间戳_30,
+            域名,
+            cookie,
+            log_func,
+            desc_prefix=f"[30天][{子平台ID}]"
+        )
+
+        for aa in 报表列表_30:
+            会员ID = aa.get('userIdx')
+            if 会员ID is None:
+                continue
+            if 会员ID not in 首存会员ID集合_30:
+                continue
+
+            会员账号 = aa.get('username') or ''
+            充值金额 = aa.get('deposit') or 0
+            有效投注 = aa.get('validBet') or 0
+
+            try:
+                充值金额 = float(充值金额)
+            except (TypeError, ValueError):
+                充值金额 = 0.0
+            try:
+                有效投注 = float(有效投注)
+            except (TypeError, ValueError):
+                有效投注 = 0.0
+
+            if 会员ID not in 用户统计_30:
+                用户统计_30[会员ID] = {
+                    "会员账号": 会员账号,
+                    "充值": 0.0,
+                    "有效投注": 0.0,
+                }
+
+            用户统计_30[会员ID]["充值"] += 充值金额
+            用户统计_30[会员ID]["有效投注"] += 有效投注
+
+        log_func(f"[30天][{子平台ID}] 参与统计的首存会员数量：{len(用户统计_30)}")
+
+        for 会员ID, 统计 in 用户统计_30.items():
+            会员账号 = 统计.get("会员账号", "")
+            累计充值 = 统计.get("充值", 0.0)
+            累计有效投注 = 统计.get("有效投注", 0.0)
+
+            if 累计充值 < 500:
+                continue
+
+            赠送金额 = 计算赠送金额(累计有效投注, 赠送档位列表_30)
+            if 赠送金额 <= 0:
+                continue
+
+            row = [
+                会员ID,
+                会员账号,
+                赠送金额,
+                累计充值,
+                累计有效投注,
+            ]
+            导出数据_30天.append(row)
+            桌面_14_30_rows.append([会员ID, 会员账号, 赠送金额, "30天"])
+
+    log_func(f"[30天][{子平台ID}] 符合赠送条件的人数：{len(导出数据_30天)}")
+
+    # ==================================================================
+    # 四、统一导出主 Excel（原来的 3 / 14 / 30 三个 sheet）
+    # ==================================================================
+    if (not 导出数据_3天 and
+        not 导出数据_14天 and
+        not 导出数据_30天):
+        log_func(f"[{子平台ID}] 3天 / 14天 / 30天 活动都没有任何会员达到赠送条件，主文件不导出。")
+    else:
+        # Sheet1：3天
+        ws3 = None
+        if 导出数据_3天:
+            ws3 = wb.active
+            ws3.title = "注册3天活动"
+            表头3 = ["会员ID", "会员账号", "建议赠送金额",
+                     "活动期累计充值", "活动期充值次数", "活动期累计有效投注"]
+            ws3.append(表头3)
+            for row in 导出数据_3天:
+                会员ID, 会员账号, 累计充值, 累计充值次数, 累计有效投注, 赠送金额 = row
+                ws3.append([
+                    会员ID,
+                    会员账号,
+                    赠送金额,
+                    累计充值,
+                    累计充值次数,
+                    累计有效投注,
+                ])
+            for row in ws3.iter_rows(min_row=1, max_row=ws3.max_row, min_col=1, max_col=len(表头3)):
+                for cell in row:
+                    cell.alignment = 对齐
+
+        # Sheet2：14天
+        if 导出数据_14天:
+            if ws3 is not None:
+                ws14 = wb.create_sheet(title="注册14天活动")
+            else:
+                ws14 = wb.active
+                ws14.title = "注册14天活动"
+
+            表头14 = ["会员ID", "会员账号", "建议赠送金额",
+                     "14日内累计充值", "14日内累计有效投注"]
+            ws14.append(表头14)
+            for row in 导出数据_14天:
+                会员ID, 会员账号, 赠送金额, 累计充值, 累计有效投注 = row
+                ws14.append([
+                    会员ID,
+                    会员账号,
+                    赠送金额,
+                    累计充值,
+                    累计有效投注,
+                ])
+            for row in ws14.iter_rows(min_row=1, max_row=ws14.max_row, min_col=1, max_col=len(表头14)):
+                for cell in row:
+                    cell.alignment = 对齐
+
+        # Sheet3：30天
+        if 导出数据_30天:
+            if ws3 is None and not 导出数据_14天:
+                ws30 = wb.active
+                ws30.title = "注册30天活动"
+            else:
+                ws30 = wb.create_sheet(title="注册30天活动")
+
+            表头30 = ["会员ID", "会员账号", "建议赠送金额",
+                     "30日内累计充值", "30日内累计有效投注"]
+            ws30.append(表头30)
+            for row in 导出数据_30天:
+                会员ID, 会员账号, 赠送金额, 累计充值, 累计有效投注 = row
+                ws30.append([
+                    会员ID,
+                    会员账号,
+                    赠送金额,
+                    累计充值,
+                    累计有效投注,
+                ])
+            for row in ws30.iter_rows(min_row=1, max_row=ws30.max_row, min_col=1, max_col=len(表头30)):
+                for cell in row:
+                    cell.alignment = 对齐
+
+        当前时间字符串 = datetime.now().strftime('%Y%m%d_%H%M%S')
+        文件名 = f"{子平台ID}_注册活动赠送_{当前时间字符串}.xlsx"
+        保存路径 = os.path.join(os.getcwd(), 文件名)
+
+        wb.save(保存路径)
+
+        # 自动打开主文件
+        try:
+            os.startfile(保存路径)
+        except Exception as e:
+            log_func(f"主文件已保存，但自动打开失败：{e}")
+
+        log_func(f"[{子平台ID}] 主文件导出完成：{保存路径}")
+
+    # ==================================================================
+    # 五、桌面专用两份文件
+    # ==================================================================
+    if 桌面_3天_rows:
+        导出桌面_注册满3天(子平台ID, 桌面_3天_rows)
+    else:
+        log_func(f"[{子平台ID}] 注册满3天无符合赠送数据，桌面文件不生成。")
+
+    if 桌面_14_30_rows:
+        导出桌面_注册满14_30(子平台ID, 桌面_14_30_rows)
+    else:
+        log_func(f"[{子平台ID}] 注册满14/30天无符合赠送数据，桌面文件不生成。")
+
+
+# ===================== 子线程 Worker（支持多子平台ID） =====================
+
+class 活动Worker(QtCore.QThread):
+    log_signal = QtCore.pyqtSignal(str)
+    finished_signal = QtCore.pyqtSignal()
+
+    def __init__(self, 平台ID, 子平台ID字符串, 域名, cookie, parent=None):
+        super().__init__(parent)
+        self.平台ID = 平台ID
+        self.子平台ID字符串 = 子平台ID字符串
+        self.域名 = 域名
+        self.cookie = cookie
+
+    def run(self):
+        try:
+            raw = (self.子平台ID字符串 or "").replace("，", ",")
+            id_list = [x.strip() for x in raw.split(",") if x.strip()]
+            if not id_list:
+                # 没填就用平台ID当子平台
+                id_list = [self.平台ID]
+
+            for child_id in id_list:
+                self.log_signal.emit(f"===== 开始处理子平台 {child_id} =====")
+                try:
+                    主流程(self.平台ID, child_id, self.域名, self.cookie,
+                           log_func=self.log_signal.emit)
+                    self.log_signal.emit(f"===== 子平台 {child_id} 处理完成 =====")
+                except Exception as e:
+                    self.log_signal.emit(f"[子平台 {child_id}] 处理过程中出错：{e}")
+        finally:
+            self.finished_signal.emit()
+
+
+# ===================== 主窗口 UI =====================
+
+class MainWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.worker = None
+        self.config_path = self.get_config_path()
+        self.init_ui()
+        self.load_config()
+
+    def get_config_path(self) -> str:
+        base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        return os.path.join(base_dir, "config.ini")
+
+    def init_ui(self):
+        self.check_network_validation()
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "AAABAAMAEBAAAAEAIABoBAAANgAAACAgAAABACAAKBEAAJ4EAAAwMAAAAQAgAGgmAADGFQAAKAAAABAAAAAgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBg/wghWf9FIVj/dCJW/4ggVf9+IFn/SABA/wQAAAAAAAAAAABA/wQiU/8lAAAAAAAAAAAAAAAAIlX/DyJW/4giV//vIlf//yJX//8iV///Ilf//yJX//8hVv/eIFj/biNY/1EiV/+7Ilf/bwAAAAAAAAAAH1T/OiJW/+MiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJV/zwAAAAAIlb/RCJW/+kiV/+kIlf/aSFV/04hVf9UIlb/fyJW/9UiV///Ilf//yJX//8iV///Ilf//yFW/8AAAAAAIVn/FyJX/2onTv8NAAAAAAAAAAAAAAAAAAAAACpV/wYiV/+WIlf//yJX//8iV///Ilf//yJX//8gVf9IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABpN/wohV/+5Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACRJ/wciVv+7Ilf//yJX//8iV///Ilf/1yJX/+8iV///Ilf//yFY/3oAAAAAAAAAAAAAAAAAAAAAAAAAAABV/wMiV/+tIlf/6iJW/9UiV///Ilf/nBdG/wshV/+wIlf//yJX//8hVv9cAAAAAAAAAAAAAAAAAAAAAAAAAAAhV/+SIlf/tSJX/3IiV//zIlf/WwAAAAAAAAAAIVf/kyJX//8iV//7H1L/GQAAAAAAAAAAAAAAAAAAAAAgVv9oIFb/dh9T/zEhVv/PHlX/KgAAAAAAAAAAAAAAACJX/54iV///Ilb/owAAAAAAAAAAAAAAAAAAAAAgVf8wIFX/PydO/w0hV/+TIFD/EAAAAAAAAAAAAAAAAAAAAAAhV//OIlb/6SBV/xgAAAAAAAAAAAAAAAAAAAAAIlX/DwAAAAAfVv9BAED/BAAAAAAAAAAAAAAAAAAAAAAkV/8jIlb/8h9V/zkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAIlf/gSFV/zYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKlX/BiRV/xUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAACAAAABAAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BJFv/DhpZ/xQXRv8LAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFj/ICFX/2whV/+qIlf/2SJX//giV///Ilf//yJX//8hVv/tIVf/uCJX/2ogUP8QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlX/DyFW/5IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8CI1j/USFX/8EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/mAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHVf/IyFX/90iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBT/yghV//lIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiU/8lIVb/5iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/+gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlX/HiJX/+EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/9iJX/2oiV//BIlf//yJX//8iV///Ilf//yJX//8iV//wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACZZ/xQhV//YIlf//yJX//8hV//tIlb/4SJX//8iV///Ilf//yJX/9IeU/8rAAAAACJW/3kiV///Ilf//yJX//8iV///Ilf//yJW/9IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXRv8LIlb/ySJX//8iV///Ilf/qiJX/4ciV///Ilf//yJX//8iVv+XHFX/CQAAAAAAAAAAIFX/SCJX//8iV///Ilf//yJX//8iV///IVb/oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFX/7IiV///Ilf/7yJW/1kgVv9QIlf//SJX//8iV//xIVf/VQAAAAAAAAAAAAAAAAAAAAAjV/8sIlf//yJX//8iV///Ilf//yJX//8iVf9aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhV/+TIlf//yFW/8YhWv8fI1f/LCJX//MiV///Ilf/0CJT/yUAAAAAAAAAAAAAAAAAAAAAAAAAABxV/yQiV///Ilf//yJX//8iV///Ilf/8RVV/wwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVf/bSJX//4hVv+LADP/BSJV/w8iV//aIlf//yFX/6EcVf8JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVn/LiJX//8iV///Ilf//yJX//8hVv+LAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBW/0chV//tIFb/UAAAAAAAAP8BIlb/ryJX//ohVv9rAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiV/9MIlf//yJX//8iV///Ilf/7iZZ/xQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhVf8nIVb/xiFV/ycAAAAAAAAAACJW/3EiV//qIFX/PwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFW/3wiV///Ilf//yJX//8iVv9iAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlX/DyFX/4okW/8OAAAAAAAAAAAhVf82IVf/zx5S/yIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlf/viJX//8iV///Ilf/pwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEfVP86AID/AgAAAAAAAAAAJFv/DiFX/5wgUP8QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNR/xYiVv/7Ilf//yJW/8kaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiVP9SJEn/BwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.setWindowTitle("注册活动彩金工具（支持多子平台ID）")
+        self.resize(680, 480)
+
+        font = QtGui.QFont("Microsoft YaHei", 10)
+        self.setFont(font)
+
+        title_label = QtWidgets.QLabel("注册活动彩金工具")
+        title_font = QtGui.QFont("Microsoft YaHei", 14, QtGui.QFont.Bold)
+        title_label.setFont(title_font)
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+
+        sub_label = QtWidgets.QLabel("支持多子平台ID，用逗号分隔；自动生成 3天 / 14天 / 30天 活动赠送报表")
+        sub_label.setAlignment(QtCore.Qt.AlignCenter)
+
+        self.edit_platform = QtWidgets.QLineEdit()
+        self.edit_platform.setPlaceholderText("例如：2610")
+
+        self.edit_child_platform = QtWidgets.QLineEdit()
+        self.edit_child_platform.setPlaceholderText("例如：2610 或 2610,2706（多子平台用逗号分隔）")
+
+        self.edit_domain = QtWidgets.QLineEdit()
+        self.edit_domain.setPlaceholderText("例如：ri52p630j.cg.ink")
+
+        self.edit_cookie = QtWidgets.QPlainTextEdit()
+        self.edit_cookie.setPlaceholderText("在此粘贴完整 Cookie")
+        self.edit_cookie.setFixedHeight(100)
+
+        form_layout = QtWidgets.QFormLayout()
+        form_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+        form_layout.setFormAlignment(QtCore.Qt.AlignTop)
+        form_layout.setHorizontalSpacing(15)
+        form_layout.setVerticalSpacing(12)
+        form_layout.addRow("平台ID：", self.edit_platform)
+        form_layout.addRow("子平台ID：", self.edit_child_platform)
+        form_layout.addRow("域名：", self.edit_domain)
+        form_layout.addRow("Cookie：", self.edit_cookie)
+
+        group_box = QtWidgets.QGroupBox("基础参数配置")
+        group_box.setLayout(form_layout)
+
+        self.btn_save = QtWidgets.QPushButton("保存配置")
+        self.btn_run = QtWidgets.QPushButton("开始运行")
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_run)
+        btn_layout.addStretch()
+
+        self.log_box = QtWidgets.QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(160)
+
+        log_group = QtWidgets.QGroupBox("运行日志")
+        log_layout = QtWidgets.QVBoxLayout()
+        log_layout.addWidget(self.log_box)
+        log_group.setLayout(log_layout)
+
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.addWidget(title_label)
+        main_layout.addWidget(sub_label)
+        main_layout.addSpacing(10)
+        main_layout.addWidget(group_box)
+        main_layout.addSpacing(10)
+        main_layout.addLayout(btn_layout)
+        main_layout.addWidget(log_group)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        self.setLayout(main_layout)
+
+        self.btn_save.clicked.connect(self.on_save_config)
+        self.btn_run.clicked.connect(self.on_start_run)
+
+    def check_network_validation(self):
+        try:
+            program_id = "WG_注册彩金"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    # -------------- 配置读写 --------------
+    def load_config(self):
+        if not os.path.exists(self.config_path):
+            return
+
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.config_path, encoding="utf-8")
+        except Exception:
+            return
+
+        if "BASIC" in config:
+            sec = config["BASIC"]
+            self.edit_platform.setText(sec.get("平台ID", ""))
+            self.edit_child_platform.setText(sec.get("子平台ID", ""))
+            self.edit_domain.setText(sec.get("域名", ""))
+            self.edit_cookie.setPlainText(sec.get("cookie", ""))
+
+    def on_save_config(self):
+        平台ID = self.edit_platform.text().strip()
+        子平台ID = self.edit_child_platform.text().strip()
+        域名 = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.toPlainText().strip()
+
+        if not 平台ID or not 子平台ID or not 域名 or not cookie:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先填写完所有配置再保存。")
+            return
+
+        config = configparser.ConfigParser()
+        config["BASIC"] = {
+            "平台ID": 平台ID,
+            "子平台ID": 子平台ID,
+            "域名": 域名,
+            "cookie": cookie,
+        }
+
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                config.write(f)
+            QtWidgets.QMessageBox.information(self, "提示", f"配置已保存到：\n{self.config_path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "错误", f"保存配置失败：\n{e}")
+
+    # -------------- 脚本运行 --------------
+    def on_start_run(self):
+        if self.worker is not None and self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "提示", "脚本正在运行中，请稍候完成后再操作。")
+            return
+
+        平台ID = self.edit_platform.text().strip()
+        子平台ID = self.edit_child_platform.text().strip()
+        域名 = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.toPlainText().strip()
+
+        if not 平台ID or not 子平台ID or not 域名 or not cookie:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先填写并保存完整配置，再开始运行。")
+            return
+
+        self.append_log("开始运行脚本.")
+        self.btn_run.setEnabled(False)
+        self.btn_save.setEnabled(False)
+
+        self.worker = 活动Worker(平台ID, 子平台ID, 域名, cookie)
+        self.worker.log_signal.connect(self.append_log)
+        self.worker.finished_signal.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_worker_finished(self):
+        self.append_log("所有子平台已处理完毕，脚本结束。")
+        self.btn_run.setEnabled(True)
+        self.btn_save.setEnabled(True)
+        self.worker = None
+
+    # -------------- 日志输出 --------------
+    def append_log(self, text: str):
+        self.log_box.append(text)
+        cursor = self.log_box.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        self.log_box.setTextCursor(cursor)
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
