@@ -1,0 +1,300 @@
+import sys
+from pathlib import Path
+from datetime import datetime
+import os
+import pandas as pd
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QLabel, QPushButton, QFileDialog, QMessageBox, QTextEdit
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+
+from openpyxl.styles import Alignment, Font as XLFont, PatternFill
+
+# ===== 配置：要统计的留存天数 =====
+DAYS = [2, 3, 4, 7, 10, 14, 20, 25, 30]
+
+
+def parse_stat_date(series: pd.Series) -> pd.Series:
+    """
+    把【统计日期】解析成真正的日期：
+    - 如果像 2025-12-02，直接用默认解析；
+    - 如果像 20251202，就按 %Y%m%d 解析。
+    """
+    s = series.astype(str).str.strip()
+    if s.str.contains("-").any():
+        return pd.to_datetime(s, errors="coerce")
+    else:
+        return pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+
+
+def process_device_retention(input_file: str) -> str:
+    """
+    核心处理函数：
+    读取 CSV -> 过滤设备 -> 计算可用留存 -> 导出格式化好的 Excel
+    返回：输出文件完整路径
+    """
+    input_path = Path(input_file)
+
+    # 读取 CSV（兼容 utf-8 / gbk）
+    try:
+        df = pd.read_csv(input_path, encoding="utf-8-sig", low_memory=False)
+    except UnicodeDecodeError:
+        df = pd.read_csv(input_path, encoding="gbk", low_memory=False)
+
+    # 只看 CNY（如不需要可注释掉）
+    if "币种" in df.columns:
+        df = df[df["币种"] == "CNY"]
+
+    # 只保留 android / ios 的 浏览器 + 原生APP
+    cond_android = (df["设备类型"] == "android") & (df["设备端"].isin(["浏览器", "原生APP"]))
+    cond_ios = (df["设备类型"] == "ios") & (df["设备端"].isin(["浏览器", "原生APP"]))
+    df = df[cond_android | cond_ios].copy()
+
+    if df.empty:
+        raise ValueError("筛选后没有数据，请检查：币种 / 设备类型 / 设备端 是否匹配。")
+
+    # 解析统计日期，计算“距离今天多少天”
+    df["_统计日期_dt"] = parse_stat_date(df["统计日期"])
+    today = pd.to_datetime(datetime.today().date())
+    df["_age_days"] = (today - df["_统计日期_dt"]).dt.days
+
+    # 显示用统计日期：2025-10-30 这种格式
+    df["统计日期"] = df["_统计日期_dt"].dt.strftime("%Y-%m-%d")
+
+    # 重命名 & 选择列
+    keep_cols = ["统计日期", "设备类型", "设备端", "首充人数", "首充金额"]
+    rename_map = {}
+
+    for d in DAYS:
+        raw_rate_col = f"{d}日(充值留存率)"
+        raw_cnt_col = f"{d}日(留存人数)"
+
+        if raw_rate_col not in df.columns or raw_cnt_col not in df.columns:
+            raise KeyError(f"原始表中缺少列：{raw_rate_col} 或 {raw_cnt_col}")
+
+        new_rate_col = f"{d}日充值留存率"
+        new_cnt_col = f"{d}日留存人数"
+
+        rename_map[raw_rate_col] = new_rate_col
+        rename_map[raw_cnt_col] = new_cnt_col
+
+        keep_cols.extend([new_rate_col, new_cnt_col])
+
+    df.rename(columns=rename_map, inplace=True)
+
+    # 把充值留存率从文本 "27.25%" 转成 数字 0.2725
+    for d in DAYS:
+        rate_col = f"{d}日充值留存率"
+        cnt_col = f"{d}日留存人数"
+
+        # 人数转数字
+        df[cnt_col] = pd.to_numeric(df[cnt_col], errors="coerce")
+
+        s = df[rate_col].astype(str).str.strip()
+        s = s.replace("", pd.NA)
+        s = s.str.rstrip("%")
+        df[rate_col] = pd.to_numeric(s, errors="coerce") / 100.0
+
+    # 未到对应 N 日的留存统统清空（NA）
+    for d in DAYS:
+        rate_col = f"{d}日充值留存率"
+        cnt_col = f"{d}日留存人数"
+
+        mask_incomplete = df["_age_days"] < d
+        df.loc[mask_incomplete, rate_col] = pd.NA
+        df.loc[mask_incomplete, cnt_col] = pd.NA
+
+    # 输出用 DataFrame
+    df_out = df[keep_cols].sort_values(["统计日期", "设备类型", "设备端"])
+
+    # 输出文件名
+    out_name = f"设备充值留存_逐设备_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    output_file = input_path.with_name(out_name)
+
+    # 写 Excel + 美化
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        sheet_name = "设备留存"
+
+        # 数据从第 3 行开始写（前两行留给表头）
+        df_out.to_excel(writer, index=False, header=False, sheet_name=sheet_name, startrow=2)
+
+        wb = writer.book
+        ws = writer.sheets[sheet_name]
+
+        # ===== 构造两行表头 =====
+        base_headers = ["统计日期", "设备类型", "设备端", "首充人数", "首充金额"]
+
+        # 第 1 行：A~E 合并写 “2~30日设备留存”
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(base_headers))
+        ws.cell(row=1, column=1, value="2~30日设备留存")
+
+        # 第 2 行：A~E 正常标题
+        for col_idx, title in enumerate(base_headers, start=1):
+            ws.cell(row=2, column=col_idx, value=title)
+
+        # 后面的天数：第 1 行写 “2日 / 3日 ...”，第 2 行写 “充值留存率 / 留存人数”
+        start_col = len(base_headers) + 1  # 从第 6 列开始
+        for i, d in enumerate(DAYS):
+            c1 = start_col + i * 2
+            c2 = c1 + 1
+
+            # 第一行：合并写 “2日”、“3日”...
+            ws.cell(row=1, column=c1, value=f"{d}日")
+            ws.merge_cells(start_row=1, start_column=c1, end_row=1, end_column=c2)
+
+            # 第二行：子标题
+            ws.cell(row=2, column=c1, value="充值留存率")
+            ws.cell(row=2, column=c2, value="留存人数")
+
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        # ===== 给充值留存率列设置百分比格式 =====
+        for i, _ in enumerate(DAYS):
+            rate_col_idx = start_col + i * 2  # 每组左列是 充值留存率
+            for row in range(3, max_row + 1):
+                cell = ws.cell(row=row, column=rate_col_idx)
+                if isinstance(cell.value, (int, float)) and cell.value is not None:
+                    cell.number_format = "0.00%"
+
+        # ===== 首充金额列不要小数点（整数显示）=====
+        amount_col_idx = 5  # 第 5 列是“首充金额”
+        for row in range(3, max_row + 1):
+            cell = ws.cell(row=row, column=amount_col_idx)
+            if isinstance(cell.value, (int, float)) and cell.value is not None:
+                cell.number_format = "0"  # 整数
+
+        # ===== 全表字体 / 对齐 / 表头底色 =====
+        center_align = Alignment(horizontal="center", vertical="center")
+        font_normal = XLFont(name="宋体", size=9)
+        font_header = XLFont(name="宋体", size=9, bold=True)
+        header_fill = PatternFill("solid", fgColor="FFD9D9D9")
+
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                cell = ws.cell(row=row, column=col)
+                cell.alignment = center_align
+
+                # 表头两行：加粗 + 灰背景
+                if row in (1, 2):
+                    cell.font = font_header
+                    cell.fill = header_fill
+                else:
+                    cell.font = font_normal
+
+    return str(output_file)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("设备首存留存生成工具")
+        self.resize(600, 400)
+
+        # 主体 widget
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+
+        # 顶部标题
+        title = QLabel("设备首存留存报表生成")
+        title_font = QFont("微软雅黑", 14, QFont.Bold)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignCenter)
+
+        # 说明文字
+        desc = QLabel(
+            "功能说明：\n"
+            "从后台导出的【设备首存留存 CSV】中，自动筛选 android / iOS 的 浏览器 & 原生APP，\n"
+            "生成 2~30 日设备充值留存报表（留存率为数字、支持后续公式统计）。"
+        )
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        desc.setFont(QFont("微软雅黑", 9))
+
+        # 按钮
+        self.btn_choose = QPushButton("选择设备首存 CSV 文件")
+        self.btn_choose.setCursor(Qt.PointingHandCursor)
+        self.btn_choose.setFixedHeight(40)
+        self.btn_choose.clicked.connect(self.on_choose_file)
+
+        # 日志输出框
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFont(QFont("Consolas", 9))
+        self.log.setStyleSheet("background-color: #F7F7F7; border-radius: 6px;")
+
+        # 布局添加控件
+        layout.addWidget(title)
+        layout.addWidget(desc)
+        layout.addWidget(self.btn_choose)
+        layout.addWidget(self.log)
+
+        # 整体美化一点
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #F0F2F5;
+            }
+            QPushButton {
+                background-color: #409EFF;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #66b1ff;
+            }
+            QPushButton:pressed {
+                background-color: #3a8ee6;
+            }
+        """)
+
+    def append_log(self, text: str):
+        self.log.append(text)
+
+    def on_choose_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择设备首存 CSV 文件",
+            "",
+            "CSV 文件 (*.csv);;所有文件 (*.*)"
+        )
+        if not file_path:
+            return
+
+        self.append_log(f"已选择文件：{file_path}")
+        self.btn_choose.setEnabled(False)
+
+        try:
+            out_file = process_device_retention(file_path)
+            self.append_log(f"生成成功：{out_file}")
+            # QMessageBox.information(self, "成功", f"生成完成！\n\n输出文件：\n{out_file}")
+
+            # === 生成后自动用系统默认程序打开文件 ===
+            try:
+                os.startfile(out_file)   # Windows 下直接用这个
+            except Exception as e:
+                self.append_log(f"自动打开文件失败：{e}")
+
+        except Exception as e:
+            self.append_log(f"发生错误：{e}")
+            QMessageBox.critical(self, "错误", f"处理失败：\n{e}")
+        finally:
+            self.btn_choose.setEnabled(True)
+
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
