@@ -1,0 +1,870 @@
+import sys
+import os
+import time
+import random
+import configparser
+from datetime import datetime
+from collections import defaultdict
+from PyQt5.QtCore import QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+import requests
+from PyQt5.QtWidgets import QMessageBox
+from PyQt5 import QtWidgets, QtCore
+from openpyxl import Workbook
+from openpyxl.styles import Alignment
+
+# ========== 配置文件名 ==========
+CONFIG_FILE = 'config.ini'
+
+# 固定的类型顺序（大表和明细用这个顺序）
+类型顺序 = ['电子', '捕鱼', '真人', '棋牌', '彩票', '体育', '区块链']
+
+
+# ================== 原统计逻辑（无界面） ==================
+
+def 随机延迟():
+    """随机延迟 1-3 秒"""
+    time.sleep(random.uniform(1, 3))
+
+
+def 请求接口_带重试(url, headers, json_data, max_retry=3):
+    """
+    通用请求方法：
+    - 每次请求失败（HTTP 4xx/5xx 或返回 code 为 40/50）时，随机延迟 1-3 秒后重试
+    - 最多重试 max_retry 次
+    - 成功返回 response.json()，失败返回 None
+    """
+    attempt = 0
+    while attempt < max_retry:
+        try:
+            resp = requests.post(url, headers=headers, json=json_data, timeout=15)
+            status = resp.status_code
+
+            # HTTP 状态码异常
+            if status >= 400:
+                attempt += 1
+                print(f'[警告] 请求失败，HTTP {status}，第 {attempt} 次重试...')
+                随机延迟()
+                continue
+
+            data = resp.json()
+
+            # 部分后台会在 JSON 里用 code 表示状态
+            code = data.get('code')
+            if code in (40, 50):
+                attempt += 1
+                print(f'[警告] 接口返回 code={code}，第 {attempt} 次重试...')
+                随机延迟()
+                continue
+
+            # 一切正常
+            return data
+
+        except Exception as e:
+            attempt += 1
+            print(f'[异常] 请求出错：{e}，第 {attempt} 次重试...')
+            随机延迟()
+
+    print('[错误] 请求多次重试仍失败，放弃本次请求。')
+    return None
+
+
+def 获取全部投注细目(start_ts, end_ts, 平台ID, 子平台ID, 域名, cookie):
+    """
+    分页获取所有投注细目，返回列表 list
+    """
+    print(f'开始获取【会员投注细目】数据... 子平台ID={子平台ID}')
+    all_records = []
+    page = 1
+    PAGE_LIMIT = 1000
+
+    headers = {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'childsitecode': 子平台ID,
+        'companycode': 平台ID,
+        'loginbacktype': '3',
+        'sitecode': 平台ID,
+        'Cookie': cookie,
+    }
+    url = f'https://{域名}/api/go-gateway-internal/noEncrypt/statistics/report/user_bet_report'
+
+    while True:
+        json_data = {
+            'currency': 'CNY',
+            'startTime': start_ts,
+            'endTime': end_ts,
+            'childSiteCode': 子平台ID,
+            'pageSort': {
+                'page': page,
+                'limit': PAGE_LIMIT,
+            },
+        }
+
+        print(f'请求投注细目第 {page} 页...')
+        data = 请求接口_带重试(url, headers, json_data)
+        if not data:
+            # 请求失败，终止循环
+            break
+
+        list_data = data.get('data', {}).get('list', []) or []
+        if not list_data:
+            print('本页无数据，结束分页。')
+            break
+
+        all_records.extend(list_data)
+
+        # 如果本页数据少于 PAGE_LIMIT，说明已经到最后一页
+        if len(list_data) < PAGE_LIMIT:
+            print('已到最后一页，结束分页。')
+            break
+
+        page += 1
+        随机延迟()
+
+    print(f'投注细目共获取 {len(all_records)} 条记录。\n')
+    return all_records
+
+
+def 获取全部会员总报表(start_ts, end_ts, 平台ID, 子平台ID, 域名, cookie):
+    """
+    分页获取所有会员总报表，返回列表 list
+    """
+    print(f'开始获取【会员总报表】数据... 子平台ID={子平台ID}')
+    all_records = []
+    page = 1
+    PAGE_LIMIT = 1000
+
+    headers = {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'childsitecode': 子平台ID,
+        'companycode': 平台ID,
+        'loginbacktype': '3',
+        'sitecode': 平台ID,
+        'Cookie': cookie,
+    }
+    url = f'https://{域名}/api/go-gateway-internal/noEncrypt/statistics/report/user_report'
+
+    while True:
+        json_data = {
+            'currency': 'CNY',
+            'startTime': start_ts,
+            'endTime': end_ts,
+            'childSiteCode': 子平台ID,
+            'pageSort': {
+                'page': page,
+                'limit': PAGE_LIMIT,
+            },
+        }
+
+        print(f'请求会员总报表第 {page} 页...')
+        data = 请求接口_带重试(url, headers, json_data)
+        if not data:
+            # 请求失败，终止循环
+            break
+
+        list_data = data.get('data', {}).get('list', []) or []
+        if not list_data:
+            print('本页无数据，结束分页。')
+            break
+
+        all_records.extend(list_data)
+        print(f'第 {page} 页获取 {len(list_data)} 条，累计 {len(all_records)} 条。')
+
+        if len(list_data) < PAGE_LIMIT:
+            print('已到最后一页，结束分页。')
+            break
+
+        page += 1
+        随机延迟()
+
+    print(f'会员总报表共获取 {len(all_records)} 条记录。\n')
+    return all_records
+
+
+def 计算用户主玩类型(投注细目列表):
+    """
+    根据投注细目，计算每个用户的主玩类型：
+    - 按每个 gameCategoryName 的 betOrderNum（注单数量）总和最大来判定
+    返回：dict[userId(str) -> 主玩类型(str)]
+    """
+    # user_id -> {game_type: betOrderNum_sum}
+    user_type_betnum = defaultdict(lambda: defaultdict(float))
+
+    for item in 投注细目列表:
+        user_id = item.get('userId')
+        if user_id is None:
+            continue
+        user_id = str(user_id)
+
+        game_type = item.get('gameCategoryName') or ''
+        if not game_type:
+            continue
+
+        bet_num = item.get('betOrderNum') or 0
+        try:
+            bet_num = float(bet_num)
+        except (TypeError, ValueError):
+            bet_num = 0.0
+
+        user_type_betnum[user_id][game_type] += bet_num
+
+    user_main_type = {}
+
+    for uid, type_dict in user_type_betnum.items():
+        main_type = None
+        max_betnum = -1
+        for t, total_bet in type_dict.items():
+            if total_bet > max_betnum:
+                main_type = t
+                max_betnum = total_bet
+        if main_type:
+            user_main_type[uid] = main_type
+
+    print(f'共计算出 {len(user_main_type)} 个用户的主玩类型（按 betOrderNum）。\n')
+    return user_main_type
+
+
+def 按类型汇总数据(user_main_type, 会员总报表列表):
+    """
+    将会员总报表按主玩类型汇总：
+    - 每个用户只归到一个主类型（已在 user_main_type 里算好）
+    - 只统计主类型在 类型顺序 里的用户
+    - 过滤掉充值 <= 0 的用户（0 充值用户不统计）
+    返回：
+      summary_by_type: dict[类型] = {'人数': x, '充值': y, '提现': z, '投注': v}
+      user_detail_list: list[{'userId','type','deposit','withdraw','validBet'}]
+    """
+    # 先按用户聚合，保证每个用户一行
+    user_stats = {}  # uid -> {'type', 'deposit', 'withdraw', 'validBet'}
+
+    for item in 会员总报表列表:
+        user_idx = item.get('userIdx')
+        if user_idx is None:
+            continue
+        uid = str(user_idx)
+
+        main_type = user_main_type.get(uid)
+        if not main_type:
+            # 没有主玩类型（可能只充值不投注），不统计
+            continue
+
+        if main_type not in 类型顺序:
+            # 不是我们关心的七大类型，忽略
+            continue
+
+        deposit = float(item.get('deposit') or 0)
+        withdraw = float(item.get('withdraw') or 0)
+        valid_bet = float(item.get('validBet') or 0)
+
+        # 行级过滤：如果这一行充值为 0，则这行不计入
+        if deposit <= 0:
+            continue
+
+        if uid not in user_stats:
+            user_stats[uid] = {
+                'type': main_type,
+                'deposit': 0.0,
+                'withdraw': 0.0,
+                'validBet': 0.0,
+            }
+
+        # 累加该用户的金额
+        user_stats[uid]['deposit'] += deposit
+        user_stats[uid]['withdraw'] += withdraw
+        user_stats[uid]['validBet'] += valid_bet
+
+    # 再从 user_stats 按类型汇总
+    summary_by_type = {
+        t: {'人数': 0, '充值': 0.0, '提现': 0.0, '投注': 0.0}
+        for t in 类型顺序
+    }
+
+    for uid, info in user_stats.items():
+        main_type = info['type']
+        if main_type not in summary_by_type:
+            continue
+
+        summary_by_type[main_type]['人数'] += 1
+        summary_by_type[main_type]['充值'] += info['deposit']
+        summary_by_type[main_type]['提现'] += info['withdraw']
+        summary_by_type[main_type]['投注'] += info['validBet']
+
+    # 转成列表形式，方便导出“分类明细”
+    user_detail_list = []
+    for uid, info in user_stats.items():
+        user_detail_list.append({
+            'userId': uid,
+            'type': info['type'],
+            'deposit': info['deposit'],
+            'withdraw': info['withdraw'],
+            'validBet': info['validBet'],
+        })
+
+    return summary_by_type, user_detail_list
+
+
+def 导出到Excel(子平台ID, 日期字符串, 汇总结果, 投注细目列表, 会员总报表列表, 分类明细列表):
+    """
+    导出到 Excel：
+    - Sheet1: 按类型统计（日期 / 类型 / 人数 / 充值 / 提现 / 投注 / 倍数 / 现金 / 盈利率）
+              A15 起再加一行小汇总表：各类型人数+客单价
+    - Sheet2: 会员投注细目（用户ID / 类型）
+    - Sheet3: 会员总报表（用户ID / 充值 / 提现 / 投注）
+    - Sheet4: 分类明细（用户ID / 类型 / 充值 / 提现 / 投注）
+    """
+    # ★★★ 文件名带上子平台ID ★★★
+    文件名 = f'游戏数据_{子平台ID}_{日期字符串}_{datetime.now().strftime("%H%M%S")}.xlsx'
+
+    wb = Workbook()
+    align_center = Alignment(horizontal='center', vertical='center')
+
+    # 顶部大表仍然用全局 类型顺序
+    # 下面小表用你指定的顺序
+    客单价顺序 = ['彩票', '电子', '棋牌', '捕鱼', '真人', '体育', '区块链']
+
+    # ===== Sheet1：按类型统计 =====
+    ws = wb.active
+    ws.title = '按类型统计'
+    ws['A1'] = '日期'
+    ws['B1'] = '类型'
+    ws['C1'] = '人数'
+    ws['D1'] = '充值'
+    ws['E1'] = '提现'
+    ws['F1'] = '投注'
+    ws['G1'] = '倍数'
+    ws['H1'] = '现金'
+    ws['I1'] = '盈利率'
+    for cell in ws['A1':'I1'][0]:
+        cell.alignment = align_center
+
+    # 主汇总表（2~8 行），只在 A2 写日期，A3~A8 为空
+    row = 2
+    for idx, t in enumerate(类型顺序):  # 顶部大表保持之前的顺序
+        data = 汇总结果.get(t, {'人数': 0, '充值': 0.0, '提现': 0.0, '投注': 0.0})
+        人数 = data['人数']
+        充值 = data['充值']
+        提现 = data['提现']
+        投注 = data['投注']
+
+        # 计算倍数、现金、盈利率
+        if 充值 > 0:
+            倍数 = 投注 / 充值
+            现金 = 充值 - 提现
+            盈利率 = 现金 / 充值
+        else:
+            倍数 = 0
+            现金 = 0
+            盈利率 = 0
+
+        # 日期列：只有第一行写日期
+        if idx == 0:
+            ws.cell(row=row, column=1, value=日期字符串)
+        else:
+            ws.cell(row=row, column=1, value="")
+
+        ws.cell(row=row, column=2, value=t)
+        ws.cell(row=row, column=3, value=人数)
+
+        cell_deposit = ws.cell(row=row, column=4, value=充值)
+        cell_withdraw = ws.cell(row=row, column=5, value=提现)
+        cell_bet = ws.cell(row=row, column=6, value=投注)
+        cell_multiple = ws.cell(row=row, column=7, value=倍数)
+        cell_cash = ws.cell(row=row, column=8, value=现金)
+        cell_profit = ws.cell(row=row, column=9, value=盈利率)
+
+        cell_deposit.number_format = '0.00'
+        cell_withdraw.number_format = '0.00'
+        cell_bet.number_format = '0.00'
+        cell_multiple.number_format = '0.00'
+        cell_cash.number_format = '0.00'
+        cell_profit.number_format = '0.00%'  # 盈利率百分比，两位小数
+
+        row += 1  # 下一个类型
+
+    for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
+        ws.column_dimensions[col].width = 12
+
+    # ===== A15 起的小汇总表：日期 + 各类型人数 & 客单价 =====
+    # 表头行：15
+    ws['A15'] = '日期'
+    col = 2
+    for t in 客单价顺序:  # 小表用自定义顺序：彩票 -> 电子 -> 棋牌 -> 捕鱼 -> 真人 -> 体育 -> 区块链
+        ws.cell(row=15, column=col,     value=f'{t}客')
+        ws.cell(row=15, column=col + 1, value='客单价')
+        col += 2
+    for cell in ws['A15':'O15'][0]:
+        cell.alignment = align_center
+
+    # 数据行：17
+    ws.cell(row=17, column=1, value=日期字符串)
+    col = 2
+    for t in 客单价顺序:
+        data = 汇总结果.get(t, {'人数': 0, '充值': 0.0})
+        人数 = data['人数']
+        充值 = data['充值']
+        if 人数 > 0:
+            客单价 = 充值 / 人数
+        else:
+            客单价 = 0
+
+        cell_user = ws.cell(row=17, column=col,     value=人数)
+        cell_avg  = ws.cell(row=17, column=col + 1, value=客单价)
+        cell_user.alignment = Alignment(horizontal='center', vertical='center')
+        cell_avg.number_format = '0.00'
+        col += 2
+
+    # ===== Sheet2：会员投注细目 =====
+    ws_bet = wb.create_sheet(title='会员投注细目')
+    ws_bet['A1'] = '用户ID'
+    ws_bet['B1'] = '类型'
+    ws_bet['A1'].alignment = align_center
+    ws_bet['B1'].alignment = align_center
+
+    row = 2
+    for item in 投注细目列表:
+        user_id = item.get('userId')
+        game_type = item.get('gameCategoryName')
+        ws_bet.cell(row=row, column=1, value=user_id)
+        ws_bet.cell(row=row, column=2, value=game_type)
+        row += 1
+
+    ws_bet.column_dimensions['A'].width = 15
+    ws_bet.column_dimensions['B'].width = 15
+
+    # ===== Sheet3：会员总报表 =====
+    ws_report = wb.create_sheet(title='会员总报表')
+    ws_report['A1'] = '用户ID'
+    ws_report['B1'] = '充值'
+    ws_report['C1'] = '提现'
+    ws_report['D1'] = '投注'
+    for cell in ws_report['A1':'D1'][0]:
+        cell.alignment = align_center
+
+    row = 2
+    for item in 会员总报表列表:
+        user_idx = item.get('userIdx')
+        deposit = item.get('deposit')
+        withdraw = item.get('withdraw')
+        valid_bet = item.get('validBet')
+
+        ws_report.cell(row=row, column=1, value=user_idx)
+        ws_report.cell(row=row, column=2, value=deposit)
+        ws_report.cell(row=row, column=3, value=withdraw)
+        ws_report.cell(row=row, column=4, value=valid_bet)
+        row += 1
+
+    ws_report.column_dimensions['A'].width = 15
+    ws_report.column_dimensions['B'].width = 15
+    ws_report.column_dimensions['C'].width = 15
+    ws_report.column_dimensions['D'].width = 15
+
+    # ===== Sheet4：分类明细（按主玩类型 + 过滤充值>0 后的用户汇总）=====
+    ws_detail = wb.create_sheet(title='分类明细')
+    ws_detail['A1'] = '用户ID'
+    ws_detail['B1'] = '类型'
+    ws_detail['C1'] = '充值'
+    ws_detail['D1'] = '提现'
+    ws_detail['E1'] = '投注'
+    for cell in ws_detail['A1':'E1'][0]:
+        cell.alignment = align_center
+
+    # 这里仍然用全局 类型顺序 排序
+    def sort_key(item):
+        t = item['type']
+        idx = 类型顺序.index(t) if t in 类型顺序 else 999
+        return (idx, item['userId'])
+
+    sorted_details = sorted(分类明细列表, key=sort_key)
+
+    row = 2
+    for item in sorted_details:
+        ws_detail.cell(row=row, column=1, value=item['userId'])
+        ws_detail.cell(row=row, column=2, value=item['type'])
+        cell_d = ws_detail.cell(row=row, column=3, value=item['deposit'])
+        cell_w = ws_detail.cell(row=row, column=4, value=item['withdraw'])
+        cell_b = ws_detail.cell(row=row, column=5, value=item['validBet'])
+        cell_d.number_format = '0.00'
+        cell_w.number_format = '0.00'
+        cell_b.number_format = '0.00'
+        row += 1
+
+    ws_detail.column_dimensions['A'].width = 15
+    ws_detail.column_dimensions['B'].width = 10
+    ws_detail.column_dimensions['C'].width = 15
+    ws_detail.column_dimensions['D'].width = 15
+    ws_detail.column_dimensions['E'].width = 15
+
+    wb.save(文件名)
+    print(f'任务完成！ Excel 已保存：{文件名}')
+    return os.path.abspath(文件名)
+
+
+def 运行统计(平台ID, 子平台ID, 域名, cookie, start_date, end_date):
+    """
+    统一入口：给定平台配置 + 开始/结束日期（datetime），执行全部流程并导出 Excel
+    """
+    # 时间戳（秒）
+    start_ts = int(datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0).timestamp())
+    end_ts = int(datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59).timestamp())
+
+    # 控制台打印成你要的格式 2025-11-24 00:00:00 / 23:59:59
+    start_str = f"{start_date.strftime('%Y-%m-%d')} 00:00:00"
+    end_str = f"{end_date.strftime('%Y-%m-%d')} 23:59:59"
+    print(f'[子平台 {子平台ID}] 统计时间：{start_str} ~ {end_str}')
+    print(f'[子平台 {子平台ID}] 开始时间戳：{start_ts}，结束时间戳：{end_ts}\n')
+
+    # Excel 里仍然用日期（不带时间），如果是区间就用起止日期
+    if start_date == end_date:
+        日期字符串 = start_date.strftime('%Y-%m-%d')
+    else:
+        日期字符串 = f'{start_date.strftime("%Y-%m-%d")}~{end_date.strftime("%Y-%m-%d")}'
+
+    # 1. 获取投注细目
+    bet_list = 获取全部投注细目(start_ts, end_ts, 平台ID, 子平台ID, 域名, cookie)
+
+    # 2. 计算每个用户的主玩类型（按 betOrderNum）
+    user_main_type = 计算用户主玩类型(bet_list)
+
+    # 3. 获取会员总报表
+    report_list = 获取全部会员总报表(start_ts, end_ts, 平台ID, 子平台ID, 域名, cookie)
+
+    # 4. 按类型汇总 + 用户明细（只统计充值 > 0 的用户）
+    summary, user_detail_list = 按类型汇总数据(user_main_type, report_list)
+
+    # 5. 导出 Excel（含 4 个工作表）
+    file_path = 导出到Excel(子平台ID, 日期字符串, summary, bet_list, report_list, user_detail_list)
+    return file_path
+
+
+# ================== 子线程 Worker（支持多子平台ID） ==================
+
+class DataWorker(QtCore.QThread):
+    finished_signal = QtCore.pyqtSignal(list)  # 成功完成，传回文件路径列表
+    error_signal = QtCore.pyqtSignal(str)      # 出错信息
+
+    def __init__(self, 平台ID, 子平台ID串, 域名, cookie, start_qdate, end_qdate, parent=None):
+        super().__init__(parent)
+        self.平台ID = 平台ID
+        self.子平台ID串 = 子平台ID串  # 可能是 "0,2706,2707"
+        self.域名 = 域名
+        self.cookie = cookie
+        self.start_qdate = start_qdate
+        self.end_qdate = end_qdate
+
+    def run(self):
+        try:
+            start_date = datetime(self.start_qdate.year(), self.start_qdate.month(), self.start_qdate.day())
+            end_date = datetime(self.end_qdate.year(), self.end_qdate.month(), self.end_qdate.day())
+
+            # 解析多个子平台ID：支持 0,2706,2707 和 0，2706（中文逗号）
+            raw = (self.子平台ID串 or "").replace("，", ",")
+            id_list = [s.strip() for s in raw.split(",") if s.strip()]
+            if not id_list:
+                id_list = ["0"]
+
+            all_paths = []
+
+            for child_id in id_list:
+                print(f'====== 开始处理子平台 {child_id} ======')
+                file_path = 运行统计(self.平台ID, child_id, self.域名, self.cookie, start_date, end_date)
+                all_paths.append(file_path)
+
+            self.finished_signal.emit(all_paths)
+
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+# ================== 主界面 ==================
+
+class MainWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.worker = None
+        self.init_ui()
+        self.load_config()
+
+    def init_ui(self):
+        self.check_network_validation()
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+        self.setWindowTitle("WG游戏数据统计（支持多子平台ID）")
+        self.resize(550, 320)
+
+        # ===== 上面：配置容器 =====
+        self.edit_platform = QtWidgets.QLineEdit()
+        self.edit_platform.setPlaceholderText("例如：2610")
+        self.edit_child = QtWidgets.QLineEdit()
+        self.edit_child.setPlaceholderText("支持多个，用英文逗号分隔，例如：0,2706,2707")
+        self.edit_domain = QtWidgets.QLineEdit()
+        self.edit_domain.setPlaceholderText("例如：ri52p630j.cg.ink（不要带 https://）")
+        self.edit_cookie = QtWidgets.QLineEdit()
+        self.edit_cookie.setPlaceholderText("在后台页面按 F12，从请求头里复制 Cookie 粘贴到这里")
+        self.edit_cookie.setMinimumWidth(400)
+        self.edit_cookie.setMinimumHeight(36)
+
+        config_form = QtWidgets.QFormLayout()
+        config_form.addRow("平台ID：", self.edit_platform)
+        config_form.addRow("子平台ID：", self.edit_child)
+        config_form.addRow("域名：", self.edit_domain)
+        config_form.addRow("Cookie：", self.edit_cookie)
+
+        group_config = QtWidgets.QGroupBox("基础配置")
+        group_config.setLayout(config_form)
+
+        # ===== 中间：时间容器 =====
+        today = QtCore.QDate.currentDate()
+        self.date_start = QtWidgets.QDateEdit(today)
+        self.date_start.setCalendarPopup(True)
+        self.date_start.setDisplayFormat("yyyy-MM-dd")
+
+        self.date_end = QtWidgets.QDateEdit(today)
+        self.date_end.setCalendarPopup(True)
+        self.date_end.setDisplayFormat("yyyy-MM-dd")
+
+        self.btn_prev = QtWidgets.QPushButton("上一日")
+        self.btn_today = QtWidgets.QPushButton("当日")
+        self.btn_next = QtWidgets.QPushButton("下一日")
+
+        # 自适应宽度的按钮策略
+        exp_policy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                           QtWidgets.QSizePolicy.Fixed)
+        for btn in (self.btn_prev, self.btn_today, self.btn_next):
+            btn.setSizePolicy(exp_policy)
+
+        self.btn_prev.clicked.connect(self.on_prev_day)
+        self.btn_today.clicked.connect(self.on_today)
+        self.btn_next.clicked.connect(self.on_next_day)
+
+        # 时间行 1：开始/结束日期
+        date_row = QtWidgets.QHBoxLayout()
+        date_row.setContentsMargins(10, 0, 10, 0)
+        date_row.addWidget(QtWidgets.QLabel("开始日期："))
+        date_row.addWidget(self.date_start)
+        date_row.addSpacing(30)
+        date_row.addWidget(QtWidgets.QLabel("结束日期："))
+        date_row.addWidget(self.date_end)
+
+        # 时间行 2：三个日期按钮
+        date_btn_row = QtWidgets.QHBoxLayout()
+        date_btn_row.setContentsMargins(10, 0, 10, 0)
+        date_btn_row.setSpacing(10)
+        date_btn_row.addWidget(self.btn_prev)
+        date_btn_row.addWidget(self.btn_today)
+        date_btn_row.addWidget(self.btn_next)
+
+        time_layout = QtWidgets.QVBoxLayout()
+        time_layout.addLayout(date_row)
+        time_layout.addSpacing(8)
+        time_layout.addLayout(date_btn_row)
+
+        group_time = QtWidgets.QGroupBox("时间设置")
+        group_time.setLayout(time_layout)
+
+        # ===== 下面：操作按钮（两按钮平均铺满一行） =====
+        self.btn_save = QtWidgets.QPushButton("保存配置")
+        self.btn_run = QtWidgets.QPushButton("运行")
+
+        for btn in (self.btn_save, self.btn_run):
+            btn.setSizePolicy(exp_policy)
+
+        self.btn_save.clicked.connect(self.on_save_config)
+        self.btn_run.clicked.connect(self.on_run)
+
+        bottom_btn_layout = QtWidgets.QHBoxLayout()
+        bottom_btn_layout.setContentsMargins(80, 0, 80, 20)
+        bottom_btn_layout.setSpacing(40)
+        bottom_btn_layout.addWidget(self.btn_save)
+        bottom_btn_layout.addWidget(self.btn_run)
+
+        # ===== 总布局 =====
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.addWidget(group_config)
+        main_layout.addWidget(group_time)
+        main_layout.addStretch()
+        main_layout.addLayout(bottom_btn_layout)
+
+        self.setLayout(main_layout)
+
+    def check_network_validation(self):
+        try:
+            program_id = "WG_游戏数据"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    # ========= 统一开关所有可编辑控件 =========
+    def set_ui_enabled(self, enabled: bool):
+        """
+        运行中禁用所有输入和按钮，结束后再启用
+        """
+        widgets = [
+            self.edit_platform,
+            self.edit_child,
+            self.edit_domain,
+            self.edit_cookie,
+            self.date_start,
+            self.date_end,
+            self.btn_prev,
+            self.btn_today,
+            self.btn_next,
+            self.btn_save,
+            self.btn_run,
+        ]
+        for w in widgets:
+            w.setEnabled(enabled)
+
+    # ========== 日期按钮逻辑 ==========
+
+    def on_today(self):
+        today = QtCore.QDate.currentDate()
+        self.date_start.setDate(today)
+        self.date_end.setDate(today)
+
+    def on_prev_day(self):
+        base = self.date_start.date()
+        prev = base.addDays(-1)
+        self.date_start.setDate(prev)
+        self.date_end.setDate(prev)
+
+    def on_next_day(self):
+        base = self.date_start.date()
+        nxt = base.addDays(1)
+        self.date_start.setDate(nxt)
+        self.date_end.setDate(nxt)
+
+    # ========== 配置读写 ==========
+
+    def load_config(self):
+        if not os.path.exists(CONFIG_FILE):
+            return
+        config = configparser.ConfigParser()
+        try:
+            config.read(CONFIG_FILE, encoding='utf-8')
+            if 'SETTINGS' in config:
+                s = config['SETTINGS']
+                self.edit_platform.setText(s.get('platform_id', ''))
+                self.edit_child.setText(s.get('child_platform_id', ''))
+                self.edit_domain.setText(s.get('domain', ''))
+                self.edit_cookie.setText(s.get('cookie', ''))
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "提示", f"加载配置失败：{e}")
+
+    def on_save_config(self):
+        platform_id = self.edit_platform.text().strip()
+        child_id_str = self.edit_child.text().strip()
+        domain = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.text().strip()
+
+        if not platform_id or not child_id_str or not domain or not cookie:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先填写完整的 平台ID / 子平台ID / 域名 / Cookie 再保存配置。")
+            return
+
+        config = configparser.ConfigParser()
+        config['SETTINGS'] = {
+            'platform_id': platform_id,
+            'child_platform_id': child_id_str,  # 这里可以是单个，也可以是 0,2706,2707
+            'domain': domain,
+            'cookie': cookie,
+        }
+
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                config.write(f)
+            QtWidgets.QMessageBox.information(self, "提示", "配置已保存。")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "提示", f"保存配置失败：{e}")
+
+    # ========== 运行按钮 ==========
+
+    def on_run(self):
+        # 防止重复运行
+        if self.worker is not None and self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "提示", "任务正在运行中，请稍候。")
+            return
+
+        platform_id = self.edit_platform.text().strip()
+        child_id_str = self.edit_child.text().strip()
+        domain = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.text().strip()
+
+        if not platform_id or not child_id_str or not domain or not cookie:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先填写完整的 平台ID / 子平台ID / 域名 / Cookie。")
+            return
+
+        start_qdate = self.date_start.date()
+        end_qdate = self.date_end.date()
+
+        if start_qdate > end_qdate:
+            QtWidgets.QMessageBox.warning(self, "提示", "开始日期不能大于结束日期。")
+            return
+
+        # 启动子线程前，禁用所有控件
+        self.set_ui_enabled(False)
+
+        self.worker = DataWorker(platform_id, child_id_str, domain, cookie, start_qdate, end_qdate)
+        self.worker.finished_signal.connect(self.on_worker_finished)
+        self.worker.error_signal.connect(self.on_worker_error)
+        self.worker.finished.connect(self.on_worker_done)
+        self.worker.start()
+
+    def on_worker_finished(self, file_paths):
+        import subprocess
+
+        # 统一转成 list
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+
+        text = "统计完成！生成以下文件：\n" + "\n".join(file_paths)
+        QtWidgets.QMessageBox.information(self, "完成", text)
+
+        # 点完 OK 后自动逐个打开文件
+        for file_path in file_paths:
+            try:
+                if os.path.exists(file_path):
+                    if sys.platform.startswith("win"):
+                        os.startfile(file_path)  # Windows
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", file_path])  # macOS
+                    else:
+                        subprocess.Popen(["xdg-open", file_path])  # Linux
+                else:
+                    QtWidgets.QMessageBox.warning(self, "提示", f"找不到导出的文件：\n{file_path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "提示", f"自动打开文件失败：{e}")
+
+    def on_worker_error(self, msg):
+        # 出错也要恢复 UI
+        QtWidgets.QMessageBox.warning(self, "错误", f"运行过程中出现错误：\n{msg}")
+        self.set_ui_enabled(True)
+
+    def on_worker_done(self):
+        # 线程结束时恢复 UI（正常结束或异常结束都会触发 finished）
+        self.set_ui_enabled(True)
+        self.worker = None
+
+
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
