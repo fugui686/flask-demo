@@ -1,0 +1,1363 @@
+import sys
+import os
+import time
+import random
+import configparser
+from datetime import datetime, timedelta, date
+from PyQt5.QtCore import QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtWidgets import QMessageBox
+import requests
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment
+from PyQt5 import QtWidgets, QtCore
+from datetime import datetime, timedelta, date as DateType
+
+# ===== 全局变量（会由 UI 设置） =====
+平台ID = ''
+子平台ID = ''
+域名 = ''
+cookie = ''
+
+headers = {}
+
+# 赠送相关倍数（默认值）
+稽核倍数 = 5
+加倍奖金奖励倍数 = 1
+加倍奖金稽核倍数 = 5
+
+
+def get_base_dir():
+    """获取程序所在目录（支持打包后 exe）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def update_headers_from_config():
+    """根据全局配置更新 headers"""
+    global headers
+    headers = {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'childsitecode': 子平台ID,
+        'companycode': 平台ID,
+        'loginbacktype': '3',
+        'sitecode': 平台ID,
+        'Cookie': cookie,
+    }
+
+
+# ===== 网络工具：POST 带重试 =====
+def post_with_retry(session, url, headers, json_data, max_retries=3, timeout=15):
+    """
+    发送 POST 请求，遇到 4xx/5xx 或网络异常，会随机延迟 1-3 秒重试，最多 max_retries 次。
+    成功返回 response，失败返回 None。
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.post(url, headers=headers, json=json_data, timeout=timeout)
+        except requests.RequestException as e:
+            print(f"[请求异常] {e}，第 {attempt} 次重试...")
+            if attempt == max_retries:
+                return None
+            time.sleep(random.uniform(1, 3))
+            continue
+
+        if 200 <= resp.status_code < 300:
+            return resp
+
+        if 400 <= resp.status_code < 600:
+            print(f"[请求失败] 状态码 {resp.status_code}，第 {attempt} 次重试...")
+            if attempt == max_retries:
+                return None
+            time.sleep(random.uniform(1, 3))
+        else:
+            return resp
+
+    return None
+
+
+def get_day_timestamp_range(dt: date):
+    """给一个日期对象，返回该日 00:00:00 ~ 23:59:59 的时间戳和字符串日期"""
+    start_dt = datetime(dt.year, dt.month, dt.day, 0, 0, 0)
+    end_dt = datetime(dt.year, dt.month, dt.day, 23, 59, 59)
+    start_ts = int(start_dt.timestamp())
+    end_ts = int(end_dt.timestamp())
+    date_str = dt.strftime('%Y-%m-%d')
+    return start_ts, end_ts, date_str
+
+
+def 获取首存用户(session, start_ts, end_ts, page_size=1000):
+    """
+    分页获取某一天的首存用户列表，返回 list[dict]，元素包含 user_id, username
+    （使用当前全局 子平台ID / 域名 / headers）
+    """
+    global 域名, 子平台ID, headers
+    url = f'https://{域名}/api/go-gateway-internal/user/advancedGetUserListV2'
+    current_page = 1
+    首存列表 = []
+
+    while True:
+        json_data = {
+            'selectTimeKey': 2,
+            'accountTypes': [],
+            'childSiteCode': 子平台ID,
+            'current': current_page,
+            'size': page_size,
+            'firstPayTimeFrom': start_ts,
+            'firstPayTimeTo': end_ts,
+        }
+
+        print(f"[{子平台ID}][首存] 获取第 {current_page} 页数据...")
+        resp = post_with_retry(session, url, headers, json_data)
+        if resp is None:
+            print(f"[{子平台ID}][首存] 第 {current_page} 页请求失败，停止。")
+            break
+
+        data = resp.json().get('data', {}).get('data', [])
+        if not data:
+            print(f"[{子平台ID}][首存] 第 {current_page} 页无数据，结束分页。")
+            break
+
+        for item in data:
+            user_id = item.get('useridx')
+            username = item.get('username')
+            if user_id is not None and username is not None:
+                首存列表.append({
+                    'user_id': str(user_id),
+                    'username': username,
+                })
+
+        print(f"[{子平台ID}][首存] 第 {current_page} 页获取 {len(data)} 条。")
+        if len(data) < page_size:
+            print(f"[{子平台ID}][首存] 数据条数不足一页，认为已到最后一页。")
+            break
+
+        current_page += 1
+        time.sleep(random.uniform(1, 3))
+
+    print(f"[{子平台ID}][首存] 总共获取首存用户 {len(首存列表)} 个。")
+    return 首存列表
+
+
+def 获取会员总报表(session, start_ts, end_ts, page_size=1000):
+    """
+    分页获取某一天会员总报表（全量），返回 list[dict]，元素包含 user_id, username, deposit, withdraw, validBet
+    （使用当前全局 子平台ID / 域名 / headers）
+    注意：现在 DailyWorker 默认不再调用本函数，而是使用【获取会员总报表_按用户】做精准拉取。
+          本函数保留，方便以后需要整天全量报表时复用。
+    """
+    global 域名, 子平台ID, headers
+    url = f'https://{域名}/api/go-gateway-internal/noEncrypt/statistics/report/user_report'
+    current_page = 1
+    报表列表 = []
+
+    while True:
+        json_data = {
+            'currency': 'CNY',
+            'startTime': start_ts,
+            'endTime': end_ts,
+            'childSiteCode': 子平台ID,
+            'pageSort': {
+                'page': current_page,
+                'limit': page_size,
+            },
+        }
+
+        print(f"[{子平台ID}][报表-全量] 获取第 {current_page} 页数据...")
+        resp = post_with_retry(session, url, headers, json_data)
+        if resp is None:
+            print(f"[{子平台ID}][报表-全量] 第 {current_page} 页请求失败，停止。")
+            break
+
+        data = resp.json().get('data', {}).get('list', [])
+        if not data:
+            print(f"[{子平台ID}][报表-全量] 第 {current_page} 页无数据，结束分页。")
+            break
+
+        for item in data:
+            user_id = item.get('userIdx')
+            username = item.get('username')
+            deposit = item.get('deposit', 0) or 0
+            withdraw = item.get('withdraw', 0) or 0
+            valid_bet = item.get('validBet', 0) or 0
+            if user_id is not None and username is not None:
+                报表列表.append({
+                    'user_id': str(user_id),
+                    'username': username,
+                    'deposit': float(deposit),
+                    'withdraw': float(withdraw),
+                    'validBet': float(valid_bet),
+                })
+
+        print(f"[{子平台ID}][报表-全量] 第 {current_page} 页获取 {len(data)} 条。")
+        if len(data) < page_size:
+            print(f"[{子平台ID}][报表-全量] 数据条数不足一页，认为已到最后一页。")
+            break
+
+        current_page += 1
+        time.sleep(random.uniform(1, 3))
+
+    print(f"[{子平台ID}][报表-全量] 总共获取会员总报表记录 {len(报表列表)} 条。")
+    return 报表列表
+
+
+def 获取会员总报表_按用户(session, start_ts, end_ts, user_id_list, page_limit=1000):
+    """
+    精准模式：只按给定的 user_id_list 拉取昨日报表，减少无关数据。
+    - user_id_list: 可迭代对象，元素为 str/int（会员ID）
+    - page_limit: 每页条数，也是每批 userIdx 的最大数量（接口一般支持 100~1000）
+    """
+    global 域名, 子平台ID, headers
+    url = f'https://{域名}/api/go-gateway-internal/noEncrypt/statistics/report/user_report'
+    报表列表 = []
+
+    # 清洗 ID 列表
+    if not user_id_list:
+        print(f"[{子平台ID}][报表-精准] 近 8 天没有任何首存会员，跳过报表拉取。")
+        return 报表列表
+
+    cleaned_ids = []
+    for uid in user_id_list:
+        s = str(uid).strip()
+        if s:
+            cleaned_ids.append(s)
+
+    if not cleaned_ids:
+        print(f"[{子平台ID}][报表-精准] 近 8 天首存会员ID清洗后为空，跳过报表拉取。")
+        return 报表列表
+
+    print(f"[{子平台ID}][报表-精准] 本次近 8 天首存会员数量：{len(cleaned_ids)}")
+
+    # 按 page_limit 分批，将 userIdx 分成多组
+    chunk_size = max(1, min(page_limit, len(cleaned_ids)))  # 至少 1，最多 page_limit
+    total_chunks = (len(cleaned_ids) + chunk_size - 1) // chunk_size
+
+    for idx, start in enumerate(range(0, len(cleaned_ids), chunk_size), start=1):
+        batch_ids = cleaned_ids[start:start + chunk_size]
+        print(f"[{子平台ID}][报表-精准] 第 {idx}/{total_chunks} 批，userIdx 数量：{len(batch_ids)}")
+
+        current_page = 1
+        while True:
+            json_data = {
+                'currency': 'CNY',
+                'startTime': start_ts,
+                'endTime': end_ts,
+                'childSiteCode': 子平台ID,
+                'userIdx': batch_ids,
+                'pageSort': {
+                    'page': current_page,
+                    'limit': page_limit,
+                },
+            }
+
+            print(f"[{子平台ID}][报表-精准] 批次 {idx}，获取第 {current_page} 页数据...")
+            resp = post_with_retry(session, url, headers, json_data)
+            if resp is None:
+                print(f"[{子平台ID}][报表-精准] 批次 {idx} 第 {current_page} 页请求失败，停止该批次。")
+                break
+
+            data = resp.json().get('data', {}).get('list', [])
+            if not data:
+                print(f"[{子平台ID}][报表-精准] 批次 {idx} 第 {current_page} 页无数据，结束该批次分页。")
+                break
+
+            for item in data:
+                user_id = item.get('userIdx')
+                username = item.get('username')
+                deposit = item.get('deposit', 0) or 0
+                withdraw = item.get('withdraw', 0) or 0
+                valid_bet = item.get('validBet', 0) or 0
+                if user_id is not None and username is not None:
+                    报表列表.append({
+                        'user_id': str(user_id),
+                        'username': username,
+                        'deposit': float(deposit),
+                        'withdraw': float(withdraw),
+                        'validBet': float(valid_bet),
+                    })
+
+            print(f"[{子平台ID}][报表-精准] 批次 {idx} 第 {current_page} 页获取 {len(data)} 条。")
+            if len(data) < page_limit:
+                print(f"[{子平台ID}][报表-精准] 批次 {idx} 第 {current_page} 页数据条数不足一页，认为已到最后一页。")
+                break
+
+            current_page += 1
+            time.sleep(random.uniform(1, 3))
+
+    print(f"[{子平台ID}][报表-精准] 最终汇总会员总报表记录 {len(报表列表)} 条。")
+    return 报表列表
+
+
+def 计算赠送金额(亏损金额):
+    """根据亏损金额返回赠送金额（新档位）"""
+    # 这里的亏损金额是 deposit - withdraw，可以是小数
+    if 10 <= 亏损金额 <= 99:
+        return 1
+    elif 100 <= 亏损金额 <= 999:
+        return 1.8
+    elif 1000 <= 亏损金额 <= 4999:
+        return 2.8
+    elif 5000 <= 亏损金额 <= 9999:
+        return 3.8
+    elif 亏损金额 >= 10000:
+        return 5.8
+    else:
+        return 0
+
+
+def 写入首存表(首存记录列表, base_dir, child_id, clear_before=False):
+    """
+    写/追加首存表：一个子平台一个文件：{child_id}首存表.xlsx
+    加了去重：按 (会员ID, 首存日期) 去重，防止同一天跑多次把同一批首存重复写入。
+    """
+    filename = os.path.join(base_dir, f"{child_id}首存表.xlsx")
+
+    # 1. 打开或新建工作簿
+    if clear_before or not os.path.exists(filename):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "首存表"
+
+        headers_row = ['会员ID', '会员账号', '首存日期']
+        ws.append(headers_row)
+        for cell in ws[1]:
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        # 由于是重建，现有 key 集合为空
+        existing_keys = set()
+    else:
+        wb = load_workbook(filename)
+        ws = wb.active
+
+        # 2. 读取现有的 (user_id, date_str) 作为已存在 key，防止重复写入
+        existing_keys = set()
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            uid, _, first_date = row
+            if not uid or not first_date:
+                continue
+
+            # 兼容 excel 里是 datetime/date 或 纯字符串
+            if isinstance(first_date, (datetime, DateType)):
+                date_str = first_date.strftime("%Y-%m-%d")
+            else:
+                date_str = str(first_date).strip()
+
+            key = (str(uid).strip(), date_str)
+            existing_keys.add(key)
+
+    # 3. 逐条写入新的记录，但如果 (user_id, date) 已经存在就跳过
+    new_count = 0
+    seen_in_batch = set()  # 防止同一批传进来的列表里自己就有重复
+
+    for item in 首存记录列表:
+        user_id = str(item.get('user_id', '')).strip()
+        username = (item.get('username') or '').strip()
+        first_date = item.get('date')
+
+        if not user_id or not first_date:
+            continue
+
+        if isinstance(first_date, (datetime, DateType)):
+            date_str = first_date.strftime("%Y-%m-%d")
+        else:
+            date_str = str(first_date).strip()
+
+        key = (user_id, date_str)
+
+        # 批次内去重 + 和已有文件中的记录去重
+        if key in seen_in_batch or key in existing_keys:
+            continue
+
+        seen_in_batch.add(key)
+        existing_keys.add(key)
+
+        ws.append([
+            user_id,
+            username,
+            date_str,
+        ])
+        new_count += 1
+
+    wb.save(filename)
+    print(f"[{child_id}][文件] 首存表已写入 {new_count} 条新记录（已做去重）：{filename}")
+
+
+def 导出会员总报表(报表列表, date_str, base_dir, child_id):
+    """
+    导出会员总报表到：{child_id}会员总报表_YYYY-MM-DD.xlsx
+    表头：会员ID、会员账号、充值、提现、投注、日期
+    （不自动打开）
+    """
+    filename = os.path.join(base_dir, f'{child_id}会员总报表_{date_str}.xlsx')
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '会员总报表'
+
+    headers_row = ['会员ID', '会员账号', '充值', '提现', '投注', '日期']
+    ws.append(headers_row)
+
+    for cell in ws[1]:
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    for item in 报表列表:
+        ws.append([
+            item['user_id'],
+            item['username'],
+            item['deposit'],
+            item['withdraw'],
+            item['validBet'],
+            date_str,
+        ])
+
+    wb.save(filename)
+    print(f"[{child_id}][文件] 已保存会员总报表：{filename}")
+
+
+def 收集近8天首存用户ID(base_dir, child_id, date_str, 今日首存列表):
+    """
+    从 {child_id}首存表.xlsx 中，结合【今日首存列表】收集【统计日往前 7 天内】的所有首存会员ID。
+    - date_str: 统计日（一般是“昨天”），格式 YYYY-MM-DD
+    - 返回：list[str] 去重后的 user_id 列表
+    """
+    filename = os.path.join(base_dir, f"{child_id}首存表.xlsx")
+    try:
+        统计日 = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        # 万一传进来的格式不对，直接不做筛选
+        统计日 = datetime.today().date()
+    起始日 = 统计日 - timedelta(days=7)
+
+    user_set = set()
+
+    # 1. 先从历史首存表里捞
+    if os.path.exists(filename):
+        try:
+            wb = load_workbook(filename)
+            ws = wb.active
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                uid, _, first_date = row
+                if not uid or not first_date:
+                    continue
+
+                # 转成 date 类型
+                if isinstance(first_date, datetime):
+                    d = first_date.date()
+                elif isinstance(first_date, DateType):
+                    d = first_date
+                else:
+                    s = str(first_date).strip()
+                    try:
+                        d = datetime.strptime(s, "%Y-%m-%d").date()
+                    except Exception:
+                        continue
+
+                if 起始日 <= d <= 统计日:
+                    user_set.add(str(uid).strip())
+        except Exception as e:
+            print(f"[{child_id}][收集近8天首存用户ID] 读取首存表出错：{e}")
+
+    # 2. 把本次接口获取到的“昨日首存列表”也一起加进去（防止刚写入还没在历史表里）
+    for item in 今日首存列表:
+        uid = str(item.get("user_id", "")).strip()
+        if uid:
+            user_set.add(uid)
+
+    ids = list(user_set)
+    print(f"[{child_id}][收集近8天首存用户ID] 统计日：{date_str}，时间窗：{起始日} ~ {统计日}，共收集到首存会员 {len(ids)} 个。")
+    return ids
+
+
+def 导出每日亏损救援金(明细列表, base_dir, child_id):
+    """
+    按子平台ID生成一份「每日亏损救援金」excel 到【桌面】并自动打开
+
+    表头：
+    品牌ID  会员ID  会员账号  奖励金额(必填)  稽核倍数(必填)  前台备注  后台备注  加倍奖金奖励倍数  加倍奖金稽核倍数
+    品牌ID = 子平台ID
+    稽核倍数 / 加倍奖金奖励倍数 / 加倍奖金稽核倍数 从全局变量读取（由 UI 设置）
+    """
+    from openpyxl import Workbook
+
+    # 没有明细就不导出
+    if not 明细列表:
+        print(f"[{child_id}][每日亏损救援金] 无赠送明细，不生成Excel。")
+        return None
+
+    global 稽核倍数, 加倍奖金奖励倍数, 加倍奖金稽核倍数
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "每日亏损救援金"
+
+    headers = [
+        "品牌ID", "会员ID", "会员账号",
+        "奖励金额(必填)", "稽核倍数(必填)",
+        "前台备注", "后台备注",
+        "加倍奖金奖励倍数", "加倍奖金稽核倍数"
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 尝试把 child_id 转成整型，保证品牌ID是数字类型
+    try:
+        brand_id_val = int(str(child_id))
+    except Exception:
+        brand_id_val = child_id
+
+    # 可以按日期排序一下，让导出更规整（先按 date 再按 user_id）
+    明细列表_sorted = sorted(
+        明细列表,
+        key=lambda d: (str(d.get("date", "")), str(d.get("user_id", "")))
+    )
+
+    for rec in 明细列表_sorted:
+        user_id = rec.get("user_id", "")
+        username = rec.get("username", "")
+        gift = rec.get("gift", 0)
+
+        row = [
+            brand_id_val,       # 品牌ID = 子平台ID
+            user_id,
+            username,
+            gift,                       # 奖励金额
+            稽核倍数,                   # 稽核倍数(必填)
+            "每日亏损救援金",            # 前台备注
+            "每日亏损救援金",            # 后台备注
+            加倍奖金奖励倍数,           # 加倍奖金奖励倍数
+            加倍奖金稽核倍数,           # 加倍奖金稽核倍数
+        ]
+        ws.append(row)
+
+    now_str = datetime.now().strftime("%m%d%H%M%S")
+
+    # === 保存到桌面并自动打开 ===
+    desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+    os.makedirs(desktop_dir, exist_ok=True)
+    filename = os.path.join(desktop_dir, f"{child_id}每日亏损救援金_{now_str}.xlsx")
+
+    wb.save(filename)
+    print(f"[{child_id}][每日亏损救援金] 已生成Excel：{filename}")
+
+    try:
+        os.startfile(filename)
+    except Exception as e:
+        print(f"[{child_id}][每日亏损救援金] 自动打开Excel失败：{e}")
+
+    return filename
+
+
+def 导出追踪表(首存列表, 报表列表, date_str, base_dir, child_id):
+    """
+    导出 7 日追踪表：{child_id}救援金追踪表_YYYY-MM-DD_HHMMSS.xlsx
+    读取 {child_id}首存表.xlsx 做历史批次，再结合“昨日报表”做统计
+    导出后自动 os.startfile 打开
+    返回：明细列表，用于生成「每日亏损救援金」excel
+    """
+    # ========== 0. 把昨日会员总报表做成索引 ==========
+    # key 用字符串 user_id，value 是整条报表
+    报表索引 = {str(item['user_id']): item for item in 报表列表}
+
+    # 8 天赠送明细（总表右侧）
+    明细列表 = []       # {user_id, username, gift, date(首存日)}
+    # 每个首存日对应的“昨日表现”明细，用于子工作表
+    每日用户明细 = {}   # {首存日: [ {user_id, username, deposit, withdraw, bet, loss}, ... ] }
+
+    # ========== 1. 从 {child_id}首存表.xlsx 里读出所有首存批次 ==========
+    首存批次映射 = {}   # { 'YYYY-MM-DD': { user_id(str): username, ... } }
+    首存表文件 = os.path.join(base_dir, f"{child_id}首存表.xlsx")
+
+    if os.path.exists(首存表文件):
+        wb_src = load_workbook(首存表文件)
+        ws_src = wb_src.active
+        # 默认结构：第 1 行表头；A:会员ID B:会员账号 C:首存日期
+        for row in ws_src.iter_rows(min_row=2, values_only=True):
+            user_id, username, first_date = row
+            if not user_id or not first_date:
+                continue
+            uid_str = str(user_id)
+            if isinstance(first_date, datetime) or isinstance(first_date, DateType):
+                fd_str = first_date.strftime("%Y-%m-%d")
+            else:
+                fd_str = str(first_date)
+            首存批次映射.setdefault(fd_str, {})[uid_str] = username or ""
+
+    # 用这次接口拿到的首存列表，再补一遍昨日的首存用户，防止首存表里还没写进去
+    day_dict = 首存批次映射.setdefault(date_str, {})
+    for user in 首存列表:
+        uid_str = str(user['user_id'])
+        uname = user.get('username', '')
+        if uid_str not in day_dict:
+            day_dict[uid_str] = uname or day_dict.get(uid_str, "")
+
+    # ========== 2. 针对 昨日 + 往前 7 天 这 8 天做处理 ==========
+    统计日 = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    # 聚合用：只存「昨日往前 7 天」这些日子的汇总（首存日本身 D0 用另一套逻辑）
+    聚合统计 = {}  # {首存日: {...汇总字段...} }
+
+    昨日赠送人数 = 0
+    昨日赠送金额总和 = 0.0
+
+    for offset in range(0, 8):  # 0 = 昨日首存日本身；1~7 = 昨日往前 7 天
+        某日 = 统计日 - timedelta(days=offset)
+        首存日_str = 某日.strftime("%Y-%m-%d")
+        用户字典 = 首存批次映射.get(首存日_str)
+        if not 用户字典:
+            continue
+
+        # 一天的首存人数
+        批次首存人数 = len(用户字典)
+
+        # 子工作表明细：无论 offset 是多少，都要把这批首存用户的“昨日数据”写进去
+        for uid_str, uname in 用户字典.items():
+            rep = 报表索引.get(uid_str)
+            if rep:
+                deposit = rep['deposit']
+                withdraw = rep['withdraw']
+                bet = rep['validBet']
+            else:
+                deposit = 0.0
+                withdraw = 0.0
+                bet = 0.0
+            loss = deposit - withdraw
+            uid_val = int(uid_str) if uid_str.isdigit() else uid_str
+
+            每日用户明细.setdefault(首存日_str, []).append({
+                "user_id": uid_val,
+                "username": uname,
+                "deposit": deposit,
+                "withdraw": withdraw,
+                "bet": bet,
+                "loss": loss,
+            })
+
+        # D0（昨日首存这批人）的赠送逻辑
+        if offset == 0:
+            for uid_str, uname in 用户字典.items():
+                rep = 报表索引.get(uid_str)
+                if rep:
+                    deposit = rep['deposit']
+                    withdraw = rep['withdraw']
+                else:
+                    deposit = 0.0
+                    withdraw = 0.0
+                loss = deposit - withdraw
+                gift = 计算赠送金额(loss)
+                if gift > 0:
+                    昨日赠送人数 += 1
+                    昨日赠送金额总和 += gift
+                    uid_val = int(uid_str) if uid_str.isdigit() else uid_str
+                    明细列表.append({
+                        "user_id": uid_val,
+                        "username": uname or (rep.get('username', '') if rep else ''),
+                        "gift": gift,
+                        "date": 首存日_str,
+                    })
+            continue  # 昨日这一天不参与 7 日追踪的汇总区，只在 A~C 显示
+
+        # ====== offset 在 1~7：用于 7 日追踪汇总 ======
+        聚合 = 聚合统计.setdefault(首存日_str, {
+            "首存人数": 批次首存人数,
+            "打码人数": 0,
+            "充值人数": 0,
+            "总充值": 0.0,
+            "总提现": 0.0,
+            "赠送人数": 0,
+            "赠送金额": 0.0,
+        })
+
+        for uid_str, uname in 用户字典.items():
+            rep = 报表索引.get(uid_str)
+            if rep:
+                deposit = rep['deposit']
+                withdraw = rep['withdraw']
+                bet = rep['validBet']
+            else:
+                deposit = 0.0
+                withdraw = 0.0
+                bet = 0.0
+            loss = deposit - withdraw
+
+            if deposit > 0:
+                聚合["充值人数"] += 1
+            if bet > 0:
+                聚合["打码人数"] += 1
+
+            聚合["总充值"] += deposit
+            聚合["总提现"] += withdraw
+
+            gift = 计算赠送金额(loss)
+            if gift > 0:
+                聚合["赠送人数"] += 1
+                聚合["赠送金额"] += gift
+                uid_val = int(uid_str) if uid_str.isdigit() else uid_str
+                明细列表.append({
+                    "user_id": uid_val,
+                    "username": uname or (rep.get('username', '') if rep else ''),
+                    "gift": gift,
+                    "date": 首存日_str,
+                })
+
+    # 昨日首存人数：直接取首存批次里当天的人数
+    首存人数_昨日 = len(首存批次映射.get(date_str, {}))
+
+    # 把聚合统计转成有顺序的列表（按首存日升序）
+    批次行列表 = []
+    for 首存日_str in sorted(聚合统计.keys()):
+        聚合 = 聚合统计[首存日_str]
+        首存人数 = 聚合["首存人数"]
+        打码人数 = 聚合["打码人数"]
+        充值人数 = 聚合["充值人数"]
+        总充值 = 聚合["总充值"]
+        总提现 = 聚合["总提现"]
+        赠送人数 = 聚合["赠送人数"]
+        赠送金额 = 聚合["赠送金额"]
+        现金 = 总充值 - 总提现
+        if 首存人数 > 0:
+            参与度数值 = round(打码人数 / 首存人数, 4)
+        else:
+            参与度数值 = 0.0
+
+        批次行列表.append({
+            "首存人数": 首存人数,
+            "打码人数": 打码人数,
+            "充值人数": 充值人数,
+            "参与度": 参与度数值,
+            "充值": 总充值,
+            "提现": 总提现,
+            "现金": 现金,
+            "赠送人数": 赠送人数,
+            "赠送金额": 赠送金额,
+            "首存日期": 首存日_str,
+        })
+
+    # ========== 3. 写入到追踪表_{child_id}_当前时间.xlsx ==========
+    now_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    输出文件 = os.path.join(base_dir, f"{child_id}救援金追踪表_{now_str}.xlsx")
+    wb_out = Workbook()
+    ws_out = wb_out.active
+    ws_out.title = "追踪表"
+
+    # 汇总表头在第 1 行（保留 D / M 空列做间隔）
+    headers = [
+        "首存人数", "赠送人数", "赠送金额", "",         # A-D
+        "打码人数", "充值人数", "参与度", "充值",       # E-H
+        "提现",     "现金",     "赠送人数", "赠送金额", # I-L
+        "", "日期"  # M, N
+    ]
+    ws_out.append(headers)
+    for cell in ws_out[1]:
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 第 2 行空行
+    ws_out.append([])
+
+    # ========= 3.1 汇总区 =========
+    if 批次行列表:
+        first_row = 批次行列表[0]
+        ws_out.append([
+            首存人数_昨日,              # A
+            昨日赠送人数,              # B
+            昨日赠送金额总和,          # C
+            "",                       # D 空列
+            first_row["打码人数"],     # E
+            first_row["充值人数"],     # F
+            first_row["参与度"],       # G
+            first_row["充值"],         # H
+            first_row["提现"],         # I
+            first_row["现金"],         # J
+            first_row["赠送人数"],     # K
+            first_row["赠送金额"],     # L
+            "",                       # M 空列
+            first_row["首存日期"],     # N
+        ])
+        ws_out.append([])
+
+        # 其余批次
+        for row in 批次行列表[1:]:
+            ws_out.append([
+                "", "", "", "",               # A-D
+                row["打码人数"],              # E
+                row["充值人数"],              # F
+                row["参与度"],                # G
+                row["充值"],                  # H
+                row["提现"],                  # I
+                row["现金"],                  # J
+                row["赠送人数"],              # K
+                row["赠送金额"],              # L
+                "",                           # M
+                row["首存日期"],              # N
+            ])
+            ws_out.append([])
+    else:
+        ws_out.append([
+            首存人数_昨日,
+            昨日赠送人数,
+            昨日赠送金额总和,
+        ])
+        ws_out.append([])
+
+    # ========= 3.2 明细区（P列开始，前 15 列做间隔） =========
+    if 明细列表:
+        # 明细表头：从 P 列开始（A~O 共 15 列先空着）
+        ws_out.append(
+            [""] * 15 + ["会员ID", "会员账号", "赠送金额", "日期"]  # P Q R S
+        )
+
+        # 明细数据：同样从 P 列开始
+        for detail in 明细列表:
+            ws_out.append(
+                [""] * 15 + [
+                    detail["user_id"],   # P
+                    detail["username"],  # Q
+                    detail["gift"],      # R
+                    detail["date"],      # S
+                ]
+            )
+
+    # ========= 3.3 按首存日生成额外工作表 =========
+    for 首存日_str in sorted(每日用户明细.keys()):
+        ws_day = wb_out.create_sheet(title=首存日_str)
+        ws_day.append(["会员ID", "会员账号", "充值", "提现", "投注", "亏损"])
+        for cell in ws_day[1]:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for row in 每日用户明细[首存日_str]:
+            ws_day.append([
+                row["user_id"],
+                row["username"],
+                row["deposit"],
+                row["withdraw"],
+                row["bet"],
+                row["loss"],
+            ])
+
+    # ========= 4. 清空 D / M / O 列的内容，但保留“空列”作为视觉间隔 =========
+    # D 列 = 4, M 列 = 13, O 列 = 15
+    max_row = ws_out.max_row
+    for col_idx in (4, 13, 15):
+        for row_idx in range(1, max_row + 1):
+            cell = ws_out.cell(row=row_idx, column=col_idx)
+            cell.value = None  # 真正变成“空单元格”
+
+    wb_out.save(输出文件)
+    print(f"[{child_id}][文件] 已生成 7 日追踪表：{输出文件}")
+    print("====== 昨日首存批次 D0 ======")
+    print(f"首存人数：{首存人数_昨日}")
+    print(f"赠送人数：{昨日赠送人数}")
+    print(f"赠送金额：{昨日赠送金额总和}")
+    print(f"明细条数（8天需要赠送）：{len(明细列表)}")
+
+    # 自动打开【救援金追踪表】
+    try:
+        os.startfile(输出文件)
+    except Exception as e:
+        print(f"[{child_id}][文件] 自动打开追踪表失败：{e}")
+
+    # 把明细列表返回给外面，用于生成「每日亏损救援金」
+    return 明细列表
+
+
+# ===== 子线程：每日更新（支持多子平台ID） =====
+class DailyWorker(QtCore.QThread):
+    success = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, base_dir, date_str, child_ids_str, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.date_str = date_str
+        self.child_ids_str = child_ids_str  # "2610" 或 "2610,2611"
+
+    def run(self):
+        global 子平台ID
+
+        try:
+            # 计算时间戳
+            target_day = datetime.strptime(self.date_str, "%Y-%m-%d").date()
+            start_ts, end_ts, date_str = get_day_timestamp_range(target_day)
+
+            print(f"[子线程-每日更新] 开始处理日期：{date_str}")
+            session = requests.Session()
+            base_dir = self.base_dir
+
+            # 解析子平台ID列表（支持英文/中文逗号）
+            raw = self.child_ids_str.replace('，', ',')
+            child_list = [p.strip() for p in raw.split(',') if p.strip()]
+            if not child_list:
+                self.error.emit("子平台ID格式错误，请用英文逗号分隔，例如：2610,2611")
+                return
+
+            for child_id in child_list:
+                print(f"\n====== 开始处理子平台 {child_id} ======")
+                子平台ID = child_id
+                update_headers_from_config()
+
+                # 1. 昨日首存（并追加写入 {child_id}首存表.xlsx）
+                首存列表 = 获取首存用户(session, start_ts, end_ts, page_size=1000)
+                首存记录列表 = [
+                    {'user_id': item['user_id'], 'username': item['username'], 'date': date_str}
+                    for item in 首存列表
+                ]
+                写入首存表(首存记录列表, base_dir, child_id, clear_before=False)
+
+                # 2. 收集近 8 天首存会员ID，按账号精准拉取昨日会员总报表
+                近8天用户ID列表 = 收集近8天首存用户ID(base_dir, child_id, date_str, 首存列表)
+                报表列表 = 获取会员总报表_按用户(session, start_ts, end_ts, 近8天用户ID列表, page_limit=1000)
+                导出会员总报表(报表列表, date_str, base_dir, child_id)
+
+                # 3. 追踪表 + 返回明细
+                明细列表 = 导出追踪表(首存列表, 报表列表, date_str, base_dir, child_id)
+
+                # 4. 按明细生成「每日亏损救援金」excel（保存到桌面并自动打开）
+                导出每日亏损救援金(明细列表, base_dir, child_id)
+
+            self.success.emit(date_str)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ===== 子线程：补历史首存（支持多子平台ID） =====
+class HistoryWorker(QtCore.QThread):
+    success = QtCore.pyqtSignal(str, str)  # start_str, end_str
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, base_dir, start_dt: date, end_dt: date, child_ids_str: str, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.start_dt = start_dt
+        self.end_dt = end_dt
+        self.child_ids_str = child_ids_str  # "2610" 或 "2610,2611"
+
+    def run(self):
+        global 子平台ID
+
+        try:
+            session = requests.Session()
+            base_dir = self.base_dir
+
+            # 解析子平台ID列表
+            raw = self.child_ids_str.replace('，', ',')
+            child_list = [p.strip() for p in raw.split(',') if p.strip()]
+            if not child_list:
+                self.error.emit("子平台ID格式错误，请用英文逗号分隔，例如：2610,2611")
+                return
+
+            for child_id in child_list:
+                print(f"\n[子线程-补历史] 开始处理子平台 {child_id} ...")
+                子平台ID = child_id
+                update_headers_from_config()
+
+                all_history_records = []
+
+                cur_day = self.start_dt
+                while cur_day <= self.end_dt:
+                    start_ts, end_ts, date_str = get_day_timestamp_range(cur_day)
+                    print(f"[{child_id}][子线程-补历史] 开始补 {date_str} 的首存数据...")
+                    首存列表 = 获取首存用户(session, start_ts, end_ts, page_size=1000)
+
+                    for item in 首存列表:
+                        all_history_records.append({
+                            'user_id': item['user_id'],
+                            'username': item['username'],
+                            'date': date_str,
+                        })
+
+                    cur_day += timedelta(days=1)
+
+                # 每个子平台单独一个首存表：清空重写
+                写入首存表(all_history_records, base_dir, child_id, clear_before=True)
+
+            self.success.emit(self.start_dt.strftime("%Y-%m-%d"),
+                              self.end_dt.strftime("%Y-%m-%d"))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ===== PyQt5 主窗口 =====
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.check_network_validation()
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.setWindowTitle("WG-首存7日救援金追踪")
+        self.resize(800, 500)
+
+        self.base_dir = get_base_dir()
+        self.config_path = os.path.join(self.base_dir, "config.ini")
+
+        self.daily_worker = None
+        self.history_worker = None
+
+        # 简单整体配色和控件样式
+        self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #f5f5f7;
+                }
+                QGroupBox {
+                    font-weight: bold;
+                    border: 1px solid #d0d0d0;
+                    border-radius: 6px;
+                    margin-top: 10px;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 4px;
+                }
+                QLabel {
+                    font-size: 12px;
+                }
+                QLineEdit, QDateEdit {
+                    background-color: #ffffff;
+                }
+                QPushButton {
+                    min-width: 130px;
+                    min-height: 32px;
+                    font-size: 12px;
+                }
+                QPushButton:disabled {
+                    background-color: #dddddd;
+                }
+                """)
+
+        # 状态栏
+        self.status = self.statusBar()
+        self.status.showMessage("就绪")
+
+        self.setup_ui()
+        self.load_config()
+
+    def check_network_validation(self):
+        try:
+            program_id = "WG_7日救援金追踪"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    def setup_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(16, 12, 16, 10)
+        main_layout.setSpacing(10)
+
+        # ===== 分组 1：平台配置 =====
+        group_base = QtWidgets.QGroupBox("平台配置")
+        base_layout = QtWidgets.QFormLayout(group_base)
+        base_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        base_layout.setFormAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        base_layout.setHorizontalSpacing(12)
+        base_layout.setVerticalSpacing(8)
+
+        self.edit_platform = QtWidgets.QLineEdit()
+        self.edit_platform.setPlaceholderText("例如：2610")
+
+        self.edit_child_platform = QtWidgets.QLineEdit()
+        self.edit_child_platform.setPlaceholderText("子平台ID，例如 2610 或 2610,2611 多个用英文逗号分隔")
+
+        self.edit_domain = QtWidgets.QLineEdit()
+        self.edit_domain.setPlaceholderText("例如：ri52p630j.cg.ink（不要带 https://）")
+
+        # 改成多行文本框，支持自动换行
+        self.edit_cookie = QtWidgets.QPlainTextEdit()
+        self.edit_cookie.setFixedHeight(80)  # 想更高就再加大一点，比如 100
+        self.edit_cookie.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)  # 按控件宽度自动换行
+        self.edit_cookie.setPlaceholderText("在后台页面按 F12，从请求头里复制 Cookie 粘贴到这里")
+
+        # 新增三个倍数输入框
+        self.edit_audit_multiple = QtWidgets.QLineEdit()
+        self.edit_audit_multiple.setPlaceholderText("例如：5")
+        self.edit_audit_multiple.setFixedWidth(80)
+
+        self.edit_bonus_multiple = QtWidgets.QLineEdit()
+        self.edit_bonus_multiple.setPlaceholderText("例如：1")
+        self.edit_bonus_multiple.setFixedWidth(80)
+
+        self.edit_bonus_audit_multiple = QtWidgets.QLineEdit()
+        self.edit_bonus_audit_multiple.setPlaceholderText("例如：5")
+        self.edit_bonus_audit_multiple.setFixedWidth(80)
+
+        # 默认值（第一次没有 config.ini 时）
+        self.edit_audit_multiple.setText("5")
+        self.edit_bonus_multiple.setText("1")
+        self.edit_bonus_audit_multiple.setText("5")
+
+        base_layout.addRow("平台ID：", self.edit_platform)
+        base_layout.addRow("子平台ID：", self.edit_child_platform)
+        base_layout.addRow("域名：", self.edit_domain)
+        base_layout.addRow("Cookie：", self.edit_cookie)
+        base_layout.addRow("稽核倍数：", self.edit_audit_multiple)
+        base_layout.addRow("加倍奖金奖励倍数：", self.edit_bonus_multiple)
+        base_layout.addRow("加倍奖金稽核倍数：", self.edit_bonus_audit_multiple)
+
+        main_layout.addWidget(group_base)
+
+        # ===== 分组 2：日期范围（补历史首存） =====
+        group_date = QtWidgets.QGroupBox("日期范围（仅用于“补历史首存”）")
+        date_layout = QtWidgets.QHBoxLayout(group_date)
+        date_layout.setContentsMargins(10, 6, 10, 8)
+        date_layout.setSpacing(12)
+
+        self.start_date_edit = QtWidgets.QDateEdit()
+        self.end_date_edit = QtWidgets.QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setCalendarPopup(True)
+
+        today = QtCore.QDate.currentDate()
+        # 默认：开始 = 8 天前，结束 = 昨天
+        self.start_date_edit.setDate(today.addDays(-8))
+        self.end_date_edit.setDate(today.addDays(-1))
+
+        date_layout.addWidget(QtWidgets.QLabel("开始日期："))
+        date_layout.addWidget(self.start_date_edit)
+        date_layout.addSpacing(20)
+        date_layout.addWidget(QtWidgets.QLabel("结束日期："))
+        date_layout.addWidget(self.end_date_edit)
+        date_layout.addStretch()
+
+        main_layout.addWidget(group_date)
+
+        # ===== 操作按钮区域 =====
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.setContentsMargins(4, 4, 4, 4)
+        btn_layout.setSpacing(20)
+
+        self.btn_save = QtWidgets.QPushButton("保存配置")
+        self.btn_daily = QtWidgets.QPushButton("运行每日更新")
+        self.btn_history = QtWidgets.QPushButton("补历史首存")
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_daily)
+        btn_layout.addWidget(self.btn_history)
+        btn_layout.addStretch()
+
+        main_layout.addLayout(btn_layout)
+
+        # 底部小提示
+        tip_label = QtWidgets.QLabel("提示：每日更新只处理“昨天”的首存与报表；补历史首存只影响首存表，不会生成追踪表。")
+        tip_label.setStyleSheet("color: #666666; font-size: 11px;")
+        main_layout.addWidget(tip_label)
+
+        # 信号连接
+        self.btn_save.clicked.connect(self.on_save_config)
+        self.btn_daily.clicked.connect(self.on_run_daily)
+        self.btn_history.clicked.connect(self.on_run_history)
+
+    def set_ui_running(self, running: bool):
+        """统一控制运行时 UI 状态，防止重复点击"""
+        self.btn_save.setEnabled(not running)
+        self.btn_daily.setEnabled(not running)
+        self.btn_history.setEnabled(not running)
+        self.start_date_edit.setEnabled(not running)
+        self.end_date_edit.setEnabled(not running)
+        self.edit_platform.setEnabled(not running)
+        self.edit_child_platform.setEnabled(not running)
+        self.edit_domain.setEnabled(not running)
+        self.edit_cookie.setEnabled(not running)
+
+        if running:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
+        else:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def load_config(self):
+        """打开程序时自动加载配置"""
+        if not os.path.exists(self.config_path):
+            return
+
+        cfg = configparser.ConfigParser()
+        cfg.read(self.config_path, encoding="utf-8")
+
+        if "BASE" in cfg:
+            base = cfg["BASE"]
+            self.edit_platform.setText(base.get("platform_id", ""))
+            self.edit_child_platform.setText(base.get("child_platform_id", ""))
+            self.edit_domain.setText(base.get("domain", ""))
+            self.edit_cookie.setPlainText(base.get("cookie", ""))
+
+            # 新增：加载三个倍数（没有就用默认值）
+            self.edit_audit_multiple.setText(base.get("audit_multiple", "5"))
+            self.edit_bonus_multiple.setText(base.get("bonus_multiple", "1"))
+            self.edit_bonus_audit_multiple.setText(base.get("bonus_audit_multiple", "5"))
+
+            self.status.showMessage("配置已自动加载", 3000)
+        else:
+            self.status.showMessage("就绪")
+
+    def on_save_config(self):
+        platform = self.edit_platform.text().strip()
+        child_platform = self.edit_child_platform.text().strip()
+        domain = self.edit_domain.text().strip()
+        cookie_text = self.edit_cookie.toPlainText().strip()
+
+        audit_multiple = self.edit_audit_multiple.text().strip() or "5"
+        bonus_multiple = self.edit_bonus_multiple.text().strip() or "1"
+        bonus_audit_multiple = self.edit_bonus_audit_multiple.text().strip() or "5"
+
+        if not platform or not child_platform or not domain or not cookie_text:
+            QtWidgets.QMessageBox.warning(self, "提示", "平台ID、子平台ID、域名、Cookie 不能为空！")
+            return
+
+        cfg = configparser.ConfigParser()
+        cfg["BASE"] = {
+            "platform_id": platform,
+            "child_platform_id": child_platform,
+            "domain": domain,
+            "cookie": cookie_text,
+            "audit_multiple": audit_multiple,
+            "bonus_multiple": bonus_multiple,
+            "bonus_audit_multiple": bonus_audit_multiple,
+        }
+
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
+        self.status.showMessage("配置已保存", 3000)
+        QtWidgets.QMessageBox.information(self, "提示", "配置已保存。")
+
+    def sync_global_config(self):
+        """把 UI 中的配置同步到全局变量并更新 headers（子平台ID这里是整个字符串，实际请求时在线程里拆分）"""
+        global 平台ID, 子平台ID, 域名, cookie
+        global 稽核倍数, 加倍奖金奖励倍数, 加倍奖金稽核倍数
+
+        平台ID = self.edit_platform.text().strip()
+        子平台ID = self.edit_child_platform.text().strip()  # 这里可能是 "2610,2611"，线程里会再拆
+        域名 = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.toPlainText().strip()
+
+        # 三个倍数：转成 float，失败就用默认
+        def to_float_or_default(text, default):
+            try:
+                return float(text)
+            except Exception:
+                return default
+
+        稽核倍数 = to_float_or_default(self.edit_audit_multiple.text().strip() or "5", 5)
+        加倍奖金奖励倍数 = to_float_or_default(self.edit_bonus_multiple.text().strip() or "1", 1)
+        加倍奖金稽核倍数 = to_float_or_default(self.edit_bonus_audit_multiple.text().strip() or "5", 5)
+
+        if not 平台ID or not 子平台ID or not 域名 or not cookie:
+            return False
+
+        update_headers_from_config()
+        return True
+
+    # ========== 每日更新 ==========
+    def on_run_daily(self):
+        """运行每日更新（子线程，支持多子平台ID）"""
+        if not self.sync_global_config():
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                "请先填写完整配置（平台ID、子平台ID、域名、Cookie）！"
+            )
+            return
+
+        today = datetime.today().date()
+        target_day = today - timedelta(days=1)
+        date_str = target_day.strftime("%Y-%m-%d")
+
+        child_ids_str = self.edit_child_platform.text().strip()
+
+        # 启动子线程
+        self.set_ui_running(True)
+        self.status.showMessage(f"正在运行每日更新（{date_str}）...", 0)
+
+        self.daily_worker = DailyWorker(self.base_dir, date_str, child_ids_str)
+        self.daily_worker.success.connect(self.on_daily_success)
+        self.daily_worker.error.connect(self.on_daily_error)
+        self.daily_worker.finished.connect(lambda: self.set_ui_running(False))
+        self.daily_worker.finished.connect(lambda: self.status.showMessage("就绪"))
+        self.daily_worker.start()
+
+    def on_daily_success(self, date_str: str):
+        QtWidgets.QMessageBox.information(self, "完成", f"昨日（{date_str}）数据处理完成。")
+
+    def on_daily_error(self, msg: str):
+        QtWidgets.QMessageBox.critical(self, "错误", f"运行每日更新时出错：\n{msg}")
+
+    # ========== 补历史首存 ==========
+    def on_run_history(self):
+        """
+        补历史首存（子线程）：
+        - 按日期范围拉首存
+        - 每个子平台单独一份 {child_id}首存表.xlsx（每次补历史会清空并重写）
+        """
+        if not self.sync_global_config():
+            QtWidgets.QMessageBox.warning(self, "提示", "请先填写完整配置（平台ID、子平台ID、域名、Cookie）！")
+            return
+
+        start_qdate = self.start_date_edit.date()
+        end_qdate = self.end_date_edit.date()
+        start_dt = date(start_qdate.year(), start_qdate.month(), start_qdate.day())
+        end_dt = date(end_qdate.year(), end_qdate.month(), end_qdate.day())
+
+        if start_dt > end_dt:
+            QtWidgets.QMessageBox.warning(self, "提示", "开始日期不能大于结束日期！")
+            return
+
+        child_ids_str = self.edit_child_platform.text().strip()
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认",
+            f"确定要补历史首存吗？\n日期范围：{start_dt} ~ {end_dt}\n"
+            f"将按子平台分别清空并重建 {child_ids_str} 对应的首存表文件。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # 启动子线程
+        self.set_ui_running(True)
+        self.status.showMessage(f"正在补历史首存（{start_dt} ~ {end_dt}）...", 0)
+
+        self.history_worker = HistoryWorker(self.base_dir, start_dt, end_dt, child_ids_str)
+        self.history_worker.success.connect(self.on_history_success)
+        self.history_worker.error.connect(self.on_history_error)
+        self.history_worker.finished.connect(lambda: self.set_ui_running(False))
+        self.history_worker.finished.connect(lambda: self.status.showMessage("就绪"))
+        self.history_worker.start()
+
+    def on_history_success(self, start_str: str, end_str: str):
+        QtWidgets.QMessageBox.information(
+            self, "完成",
+            f"历史首存补数完成：{start_str} ~ {end_str}\n(各子平台首存表已重新生成)。"
+        )
+
+    def on_history_error(self, msg: str):
+        QtWidgets.QMessageBox.critical(self, "错误", f"补历史首存时出错：\n{msg}")
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
