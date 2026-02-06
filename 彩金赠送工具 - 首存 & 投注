@@ -1,0 +1,736 @@
+import sys
+import os
+import time
+import random
+import configparser
+from datetime import datetime, timedelta
+import requests
+from openpyxl import Workbook
+from openpyxl.styles import Alignment
+from PyQt5 import QtWidgets, QtGui, QtCore
+from PyQt5.QtCore import QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtWidgets import QMessageBox
+
+
+def get_desktop_path():
+    """获取桌面路径"""
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def get_today_timestamp_range():
+    """获取当天 00:00:00 ~ 23:59:59 的时间戳范围"""
+    now = datetime.now()
+    start = datetime(now.year, now.month, now.day, 0, 0, 0)
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def make_headers(platform_id, child_site_id, cookie):
+    """构造请求头"""
+    return {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'childsitecode': str(child_site_id),
+        'companycode': str(platform_id),
+        'loginbacktype': '3',
+        'sitecode': str(platform_id),
+        'Cookie': cookie,
+    }
+
+
+def random_sleep(min_sec=1, max_sec=3, prefix=''):
+    """随机延迟，防止请求过快"""
+    sec = random.uniform(min_sec, max_sec)
+    if prefix:
+        print(f"{prefix}，随机延迟 {sec:.2f} 秒...")
+    time.sleep(sec)
+
+
+def post_with_retry(url, headers, json_data, max_retries=3):
+    """
+    通用 POST 请求（带 4xx/5xx/异常重试）
+    """
+    retry = 0
+    while retry < max_retries:
+        try:
+            resp = requests.post(url, headers=headers, json=json_data, timeout=15)
+        except requests.RequestException as e:
+            retry += 1
+            print(f"请求异常：{e}（第 {retry} 次重试）")
+            if retry >= max_retries:
+                print("重试次数达到上限，放弃该请求。")
+                return None
+            random_sleep(1, 3, "请求异常，准备重试")
+            continue
+
+        if 200 <= resp.status_code < 300:
+            return resp
+
+        if 400 <= resp.status_code < 600:
+            retry += 1
+            print(f"返回状态码 {resp.status_code}（第 {retry} 次重试）")
+            if retry >= max_retries:
+                print("重试次数达到上限，放弃该请求。")
+                return None
+            random_sleep(1, 3, "遇到 4xx/5xx，准备重试")
+        else:
+            print(f"返回未知状态码 {resp.status_code}，不重试。")
+            return None
+    return None
+
+
+# ================== 活动一：首存彩金（致电神秘彩金） ================== #
+
+def fetch_first_deposit_users(platform_id, child_site_id, domain, cookie):
+    """
+    拉取当日所有首存用户（自动翻页，每页 1000 条）
+    """
+    start_ts, end_ts = get_today_timestamp_range()
+    url = f'https://{domain}/api/go-gateway-internal/user/advancedGetUserListV2'
+    headers = make_headers(platform_id, child_site_id, cookie)
+
+    template = {
+        'selectTimeKey': 2,
+        'accountTypes': [],
+        'childSiteCode': str(child_site_id),
+        'current': 1,
+        'size': 1000,
+        'firstPayTimeFrom': start_ts,
+        'firstPayTimeTo': end_ts,
+    }
+
+    all_data = []
+    page = 1
+    size = template['size']
+
+    while True:
+        print(f"[首存][{child_site_id}] 请求第 {page} 页（每页 {size} 条）...")
+        json_data = template.copy()
+        json_data['current'] = page
+
+        resp = post_with_retry(url, headers, json_data, max_retries=3)
+        if resp is None:
+            print(f"[首存][{child_site_id}] 第 {page} 页获取失败，终止翻页。")
+            break
+
+        data = resp.json().get('data', {})
+        lst = data.get('data', []) or []
+        count = len(lst)
+        print(f"[首存][{child_site_id}] 第 {page} 页获取成功，条数：{count}")
+        if count == 0:
+            print(f"[首存][{child_site_id}] 当前页无数据，结束翻页。")
+            break
+
+        all_data.extend(lst)
+
+        if count < size:
+            print(f"[首存][{child_site_id}] 已到最后一页，结束翻页。")
+            break
+
+        random_sleep(1, 3, f"[首存][{child_site_id}] 第 {page} 页处理完毕，准备下一页")
+        page += 1
+
+    print(f"[首存][{child_site_id}] 当日首存会员总数：{len(all_data)}")
+    return all_data
+
+
+def calc_first_deposit_bonus(first_amount):
+    """
+    首存金额 <= 100 的用户，固定送 1.8
+    """
+    try:
+        amt = float(first_amount)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if 0 < amt <= 100:
+        return 1.8
+    return 0.0
+
+
+def export_first_deposit_excel(platform_id, child_site_id, domain, cookie):
+    """
+    导出首存彩金 Excel 到桌面
+    前台备注 / 后台备注：致电神秘彩金
+    """
+    data = fetch_first_deposit_users(platform_id, child_site_id, domain, cookie)
+    if not data:
+        raise RuntimeError(f"[{child_site_id}] 没有获取到首存会员数据。")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "首存赠送"
+
+    # 统一表头
+    ws.append(["品牌ID", "会员ID", "会员账号", "奖励金额(必填)", "稽核倍数(必填)", "前台备注", "后台备注"])
+
+    total_bonus = 0.0
+    count = 0
+
+    for u in data:
+        user_id = u.get('useridx')
+        username = u.get('username')
+        first_amt = u.get('firstPayAmount')
+
+        bonus = calc_first_deposit_bonus(first_amt)
+        if bonus <= 0:
+            continue
+
+        audit_times = 1
+        remark_front = "致电神秘彩金"
+        remark_back = "致电神秘彩金"
+
+        ws.append([int(child_site_id), user_id, username, bonus, audit_times, remark_front, remark_back])
+        total_bonus += bonus
+        count += 1
+
+    if count == 0:
+        raise RuntimeError(f"[{child_site_id}] 首存条件内没有符合赠送的会员。")
+
+    # 美化表头 & 自动列宽
+    for cell in ws[1]:
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    for column_cells in ws.columns:
+        max_len = 0
+        col = column_cells[0].column_letter
+        for cell in column_cells:
+            if cell.value is not None:
+                length = len(str(cell.value))
+                if length > max_len:
+                    max_len = length
+        ws.column_dimensions[col].width = max_len + 2
+
+    desktop = get_desktop_path()
+    os.makedirs(desktop, exist_ok=True)
+    ts = datetime.now().strftime("%m%d%H%M%S")
+    filename = os.path.join(desktop, f"{child_site_id}首存彩金_{ts}.xlsx")
+    wb.save(filename)
+    os.startfile(filename)
+    print(f"[首存][{child_site_id}] 导出完成：{filename}，共 {count} 人，总金额 {total_bonus:.2f} 元")
+    return filename, count, total_bonus
+
+
+# ================== 活动二：活跃礼金（有效投注） ================== #
+
+def fetch_bet_report(platform_id, child_site_id, domain, cookie):
+    """
+    拉取当日投注报表（自动翻页，每页 1000 条）
+    """
+    start_ts, end_ts = get_today_timestamp_range()
+    url = f'https://{domain}/api/go-gateway-internal/noEncrypt/statistics/report/user_report'
+    headers = make_headers(platform_id, child_site_id, cookie)
+
+    template = {
+        'currency': 'CNY',
+        'startTime': start_ts,
+        'endTime': end_ts,
+        'childSiteCode': str(child_site_id),
+        'pageSort': {
+            'page': 1,
+            'limit': 1000,
+        },
+    }
+
+    all_data = []
+    page = 1
+    limit = template['pageSort']['limit']
+
+    while True:
+        json_data = template.copy()
+        json_data['pageSort'] = template['pageSort'].copy()
+        json_data['pageSort']['page'] = page
+
+        resp = post_with_retry(url, headers, json_data, max_retries=3)
+        if resp is None:
+            print(f"[投注][{child_site_id}] 第 {page} 页获取失败，终止翻页。")
+            break
+
+        data = resp.json().get('data', {})
+        lst = data.get('list', []) or []
+        count = len(lst)
+        print(f"[投注][{child_site_id}] 第 {page} 页获取成功，条数：{count}")
+
+        if count == 0:
+            print(f"[投注][{child_site_id}] 当前页无数据，结束翻页。")
+            break
+
+        all_data.extend(lst)
+
+        if count < limit:
+            print(f"[投注][{child_site_id}] 已到最后一页，结束翻页。")
+            break
+
+        random_sleep(1, 3, f"[投注][{child_site_id}] 第 {page} 页处理完毕，准备下一页")
+        page += 1
+
+    print(f"[投注][{child_site_id}] 当日会员报表记录数：{len(all_data)}")
+    return all_data
+
+
+def calc_bet_bonus(valid_bet, max_bonus=8.0):
+    """
+    有效投注 * 0.001，封顶 8 元
+    """
+    try:
+        vb = float(valid_bet)
+    except (TypeError, ValueError):
+        vb = 0.0
+    if vb <= 0:
+        return 0.0
+    bonus = vb * 0.001
+    if bonus > max_bonus:
+        bonus = max_bonus
+    return round(bonus, 2)
+
+
+def export_bet_excel(platform_id, child_site_id, domain, cookie):
+    """
+    导出活跃礼金 Excel 到桌面
+    前台备注 / 后台备注：活跃礼金
+    """
+    data = fetch_bet_report(platform_id, child_site_id, domain, cookie)
+    if not data:
+        raise RuntimeError(f"[{child_site_id}] 没有获取到投注报表数据。")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "投注赠送"
+
+    ws.append(["品牌ID", "会员ID", "会员账号", "奖励金额(必填)", "稽核倍数(必填)", "前台备注", "后台备注"])
+
+    total_bonus = 0.0
+    count = 0
+
+    for u in data:
+        user_id = u.get('userIdx')
+        username = u.get('username')
+        valid_bet = u.get('validBet', 0)
+
+        bonus = calc_bet_bonus(valid_bet, max_bonus=8.0)
+        if bonus <= 0:
+            continue
+
+        audit_times = 1
+        remark_front = "活跃礼金"
+        remark_back = "活跃礼金"
+
+        ws.append([int(child_site_id), user_id, username, bonus, audit_times, remark_front, remark_back])
+        total_bonus += bonus
+        count += 1
+
+    if count == 0:
+        raise RuntimeError(f"[{child_site_id}] 没有任何会员符合投注赠送条件。")
+
+    for cell in ws[1]:
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    for column_cells in ws.columns:
+        max_len = 0
+        col = column_cells[0].column_letter
+        for cell in column_cells:
+            if cell.value is not None:
+                length = len(str(cell.value))
+                if length > max_len:
+                    max_len = length
+        ws.column_dimensions[col].width = max_len + 2
+
+    desktop = get_desktop_path()
+    os.makedirs(desktop, exist_ok=True)
+    ts = datetime.now().strftime("%m%d%H%M%S")
+    filename = os.path.join(desktop, f"{child_site_id}活跃礼金_{ts}.xlsx")
+    wb.save(filename)
+    os.startfile(filename)
+    print(f"[投注][{child_site_id}] 导出完成：{filename}，共 {count} 人，总金额 {total_bonus:.2f} 元")
+    return filename, count, total_bonus
+
+
+# ================== QThread 子线程 ================== #
+
+class BonusWorker(QtCore.QThread):
+    """
+    通用子线程：
+    bonus_type: 'first' 首存 / 'bet' 投注
+    child 可以是单个ID，也可以是 '2610,2611,2612'
+    """
+    finished = QtCore.pyqtSignal(str, int, float, str)  # filename, count, total, bonus_type
+    error = QtCore.pyqtSignal(str, str)                 # error_msg, bonus_type
+    log_msg = QtCore.pyqtSignal(str)                    # 子线程发日志到主线程
+
+    def __init__(self, platform, child, domain, cookie, bonus_type, parent=None):
+        super().__init__(parent)
+        self.platform = platform
+        self.child = child          # 这里可能是 "2610" 或 "2610,2611"
+        self.domain = domain
+        self.cookie = cookie
+        self.bonus_type = bonus_type
+
+    def run(self):
+        # 解析子平台ID列表：支持英文逗号，顺便把中文逗号也替换一下
+        raw = str(self.child).replace('，', ',')
+        parts = [p.strip() for p in raw.split(',') if p.strip()]
+        if not parts:
+            self.error.emit("子平台ID格式错误，请用英文逗号 , 分隔，例如：2610,2611", self.bonus_type)
+            return
+
+        total_count_all = 0
+        total_bonus_all = 0.0
+        last_filename = ""
+
+        # 日志里的名称
+        if self.bonus_type == "first":
+            bonus_log_name = "首存彩金"
+        else:
+            bonus_log_name = "活跃礼金"
+
+        try:
+            for child_id in parts:
+                if self.bonus_type == "first":
+                    filename, count, total = export_first_deposit_excel(
+                        self.platform, child_id, self.domain, self.cookie
+                    )
+                else:
+                    filename, count, total = export_bet_excel(
+                        self.platform, child_id, self.domain, self.cookie
+                    )
+
+                total_count_all += count
+                total_bonus_all += total
+                last_filename = filename
+
+                # 金额取整，不要小数点
+                total_int = int(total)
+
+                self.log_msg.emit(
+                    f"[{child_id}] {bonus_log_name}：人数 {count} 金额 {total_int}"
+                )
+        except Exception as e:
+            self.error.emit(str(e), self.bonus_type)
+            return
+
+        # 合计金额也取整
+        total_all_int = int(total_bonus_all)
+        self.log_msg.emit(
+            f"总计: {bonus_log_name}：人数 {total_count_all} 金额 {total_all_int}"
+        )
+
+        self.finished.emit(last_filename, total_count_all, total_bonus_all, self.bonus_type)
+
+
+# ================== PyQt5 UI ================== #
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.check_network_validation()
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "AAABAAMAEBAAAAEAIABoBAAANgAAACAgAAABACAAKBEAAJ4EAAAwMAAAAQAgAGgmAADGFQAAKAAAABAAAAAgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBg/wghWf9FIVj/dCJW/4ggVf9+IFn/SABA/wQAAAAAAAAAAABA/wQiU/8lAAAAAAAAAAAAAAAAIlX/DyJW/4giV//vIlf//yJX//8iV///Ilf//yJX//8hVv/eIFj/biNY/1EiV/+7Ilf/bwAAAAAAAAAAH1T/OiJW/+MiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJV/zwAAAAAIlb/RCJW/+kiV/+kIlf/aSFV/04hVf9UIlb/fyJW/9UiV///Ilf//yJX//8iV///Ilf//yFW/8AAAAAAIVn/FyJX/2onTv8NAAAAAAAAAAAAAAAAAAAAACpV/wYiV/+WIlf//yJX//8iV///Ilf//yJX//8gVf9IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABpN/wohV/+5Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACRJ/wciVv+7Ilf//yJX//8iV///Ilf/1yJX/+8iV///Ilf//yFY/3oAAAAAAAAAAAAAAAAAAAAAAAAAAABV/wMiV/+tIlf/6iJW/9UiV///Ilf/nBdG/wshV/+wIlf//yJX//8hVv9cAAAAAAAAAAAAAAAAAAAAAAAAAAAhV/+SIlf/tSJX/3IiV//zIlf/WwAAAAAAAAAAIVf/kyJX//8iV//7H1L/GQAAAAAAAAAAAAAAAAAAAAAgVv9oIFb/dh9T/zEhVv/PHlX/KgAAAAAAAAAAAAAAACJX/54iV///Ilb/owAAAAAAAAAAAAAAAAAAAAAgVf8wIFX/PydO/w0hV/+TIFD/EAAAAAAAAAAAAAAAAAAAAAAhV//OIlb/6SBV/xgAAAAAAAAAAAAAAAAAAAAAIlX/DwAAAAAfVv9BAED/BAAAAAAAAAAAAAAAAAAAAAAkV/8jIlb/8h9V/zkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAIlf/gSFV/zYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKlX/BiRV/xUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAACAAAABAAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BJFv/DhpZ/xQXRv8LAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFj/ICFX/2whV/+qIlf/2SJX//giV///Ilf//yJX//8hVv/tIVf/uCJX/2ogUP8QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlX/DyFW/5IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8CI1j/USFX/8EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.setWindowTitle("彩金赠送工具 - 首存 & 活跃礼金")
+        self.resize(600, 320)
+
+        self.config_path = self.get_config_path()
+        self.first_worker = None
+        self.bet_worker = None
+
+        self.init_ui()
+        self.load_config()
+
+    def check_network_validation(self):
+        try:
+            program_id = "WG_首存活跃彩金"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    def get_config_path(self):
+        """获取 config.ini 路径（兼容打包后）"""
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base_dir, "config.ini")
+
+    def init_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
+
+        # ---- 表单区域 ----
+        form_group = QtWidgets.QGroupBox("基础配置")
+        form_layout = QtWidgets.QFormLayout(form_group)
+        form_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+        form_layout.setFormAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        form_layout.setHorizontalSpacing(15)
+        form_layout.setVerticalSpacing(10)
+
+        self.edit_platform = QtWidgets.QLineEdit()
+        self.edit_child = QtWidgets.QLineEdit()
+        self.edit_domain = QtWidgets.QLineEdit()
+        self.edit_cookie = QtWidgets.QLineEdit()
+        self.edit_cookie.setMinimumHeight(40)
+
+        self.edit_platform.setPlaceholderText("例如：2610（平台ID，一般固定）")
+        self.edit_child.setPlaceholderText("例如：2610 或 2610,2611 多个用英文逗号分隔")
+        self.edit_domain.setPlaceholderText("例如：ri52p630j.cg.ink")
+        self.edit_cookie.setPlaceholderText("在后台复制整条 Cookie 粘贴到这里")
+
+        form_layout.addRow("平台ID：", self.edit_platform)
+        form_layout.addRow("子平台ID：", self.edit_child)
+        form_layout.addRow("域名：", self.edit_domain)
+        form_layout.addRow("Cookie：", self.edit_cookie)
+
+        main_layout.addWidget(form_group)
+
+        # ---- 按钮区域 ----
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch(1)
+
+        self.btn_save = QtWidgets.QPushButton("保存配置")
+        self.btn_first = QtWidgets.QPushButton("首存彩金")
+        self.btn_bet = QtWidgets.QPushButton("活跃礼金")
+
+        self.btn_save.setObjectName("btn_save")
+
+        self.btn_save.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btn_first.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btn_bet.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+
+        self.btn_save.setMinimumWidth(100)
+        self.btn_first.setMinimumWidth(100)
+        self.btn_bet.setMinimumWidth(100)
+
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_first)
+        btn_layout.addWidget(self.btn_bet)
+
+        main_layout.addLayout(btn_layout)
+
+        # ---- 日志区域 ----
+        self.log_edit = QtWidgets.QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFixedHeight(120)
+        self.log_edit.setPlaceholderText("运行日志会显示在这里...")
+        main_layout.addWidget(self.log_edit)
+
+        # 绑定信号
+        self.btn_save.clicked.connect(self.save_config)
+        self.btn_first.clicked.connect(self.on_first_bonus_clicked)
+        self.btn_bet.clicked.connect(self.on_bet_bonus_clicked)
+
+        # 美化
+        self.apply_styles()
+
+    def apply_styles(self):
+        """简单美化 UI"""
+        self.setStyleSheet("""
+        QMainWindow {
+            background-color: #f5f7fb;
+        }
+        QGroupBox {
+            font-size: 14px;
+            font-weight: bold;
+            border: 1px solid #d0d7e2;
+            border-radius: 8px;
+            margin-top: 10px;
+            padding: 10px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 0 5px;
+        }
+        QLabel {
+            font-size: 13px;
+        }
+        QLineEdit {
+            font-size: 13px;
+            padding: 6px 8px;
+            border: 1px solid #c0c6d4;
+            border-radius: 6px;
+            background: #ffffff;
+        }
+        QLineEdit:focus {
+            border: 1px solid #409eff;
+            background: #ffffff;
+        }
+        QPushButton {
+            font-size: 13px;
+            padding: 6px 15px;
+            border-radius: 16px;
+            border: 1px solid #409eff;
+            background-color: #409eff;
+            color: #ffffff;
+        }
+        QPushButton:hover {
+            background-color: #66b1ff;
+            border-color: #66b1ff;
+        }
+        QPushButton#btn_save {
+            background-color: #67c23a;
+            border-color: #67c23a;
+        }
+        QTextEdit {
+            font-size: 12px;
+            border-radius: 8px;
+            border: 1px solid #d0d7e2;
+            background: #ffffff;
+        }
+        """)
+
+    def log(self, text):
+        self.log_edit.append(text)
+
+    def load_config(self):
+        """启动时自动加载 config.ini"""
+        cfg = configparser.ConfigParser()
+        if not os.path.exists(self.config_path):
+            self.log("未找到配置文件，将使用默认空配置。")
+            return
+        try:
+            cfg.read(self.config_path, encoding="utf-8")
+            if "BASE" in cfg:
+                base = cfg["BASE"]
+                self.edit_platform.setText(base.get("platform_id", ""))
+                self.edit_child.setText(base.get("child_site_id", ""))
+                self.edit_domain.setText(base.get("domain", ""))
+                self.edit_cookie.setText(base.get("cookie", ""))
+                self.log("配置已加载。")
+            else:
+                self.log("配置文件中未找到 [BASE] 配置段。")
+        except Exception as e:
+            self.log(f"加载配置失败：{e}")
+
+    def save_config(self):
+        """保存配置到 config.ini"""
+        platform = self.edit_platform.text().strip()
+        child = self.edit_child.text().strip()
+        domain = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.text().strip()
+
+        if not platform or not child or not domain or not cookie:
+            QtWidgets.QMessageBox.warning(self, "提示", "平台ID、子平台ID、域名、Cookie 都不能为空。")
+            return
+
+        cfg = configparser.ConfigParser()
+        cfg["BASE"] = {
+            "platform_id": platform,
+            "child_site_id": child,
+            "domain": domain,
+            "cookie": cookie,
+        }
+
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                cfg.write(f)
+            self.log("配置已保存。")
+            QtWidgets.QMessageBox.information(self, "提示", "配置保存成功！")
+        except Exception as e:
+            self.log(f"保存配置失败：{e}")
+            QtWidgets.QMessageBox.critical(self, "错误", f"保存配置失败：{e}")
+
+    def get_current_config(self):
+        """从输入框拿当前配置"""
+        platform = self.edit_platform.text().strip()
+        child = self.edit_child.text().strip()
+        domain = self.edit_domain.text().strip()
+        cookie = self.edit_cookie.text().strip()
+        if not platform or not child or not domain or not cookie:
+            raise ValueError("平台ID、子平台ID、域名、Cookie 都不能为空。")
+        return platform, child, domain, cookie
+
+    def set_buttons_enabled(self, enabled: bool):
+        self.btn_save.setEnabled(enabled)
+        self.btn_first.setEnabled(enabled)
+        self.btn_bet.setEnabled(enabled)
+
+    # ------- 子线程相关槽函数 ------- #
+
+    def on_first_bonus_clicked(self):
+        """点击首存彩金（启动子线程）"""
+        try:
+            platform, child, domain, cookie = self.get_current_config()
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "提示", str(e))
+            return
+
+        self.log("开始生成【首存彩金 - 致电神秘彩金】表格（支持多个子平台ID）...")
+        self.set_buttons_enabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+
+        self.first_worker = BonusWorker(platform, child, domain, cookie, bonus_type="first")
+        self.first_worker.log_msg.connect(self.log)
+        self.first_worker.finished.connect(self.on_worker_finished)
+        self.first_worker.error.connect(self.on_worker_error)
+        self.first_worker.finished.connect(lambda *_: self.restore_ui_after_worker())
+        self.first_worker.error.connect(lambda *_: self.restore_ui_after_worker())
+        self.first_worker.start()
+
+    def on_bet_bonus_clicked(self):
+        """点击活跃礼金（启动子线程）"""
+        try:
+            platform, child, domain, cookie = self.get_current_config()
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "提示", str(e))
+            return
+
+        self.log("开始生成【有效投注 - 活跃礼金】表格（支持多个子平台ID）...")
+        self.set_buttons_enabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+
+        self.bet_worker = BonusWorker(platform, child, domain, cookie, bonus_type="bet")
+        self.bet_worker.log_msg.connect(self.log)
+        self.bet_worker.finished.connect(self.on_worker_finished)
+        self.bet_worker.error.connect(self.on_worker_error)
+        self.bet_worker.finished.connect(lambda *_: self.restore_ui_after_worker())
+        self.bet_worker.error.connect(lambda *_: self.restore_ui_after_worker())
+        self.bet_worker.start()
+
+    def restore_ui_after_worker(self):
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.set_buttons_enabled(True)
+
+    def on_worker_finished(self, filename, count, total, bonus_type):
+        if bonus_type == "first":
+            QtWidgets.QMessageBox.information(self, "完成", "首存彩金导出完成")
+        else:
+            QtWidgets.QMessageBox.information(self, "完成", "活跃礼金导出完成")
+
+    def on_worker_error(self, error_msg, bonus_type):
+        if bonus_type == "first":
+            self.log(f"首存彩金导出失败：{error_msg}")
+            QtWidgets.QMessageBox.critical(self, "错误", f"首存彩金导出失败：{error_msg}")
+        else:
+            self.log(f"活跃礼金导出失败：{error_msg}")
+            QtWidgets.QMessageBox.critical(self, "错误", f"活跃礼金导出失败：{error_msg}")
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
